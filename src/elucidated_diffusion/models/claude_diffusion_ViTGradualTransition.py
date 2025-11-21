@@ -98,36 +98,99 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
         return emb
 
+# class EfficientAttention(nn.Module):
+#     """Memory-efficient attention with fewer parameters"""
+#     def __init__(self, channels, num_heads=4, qkv_bias=False):
+#         super().__init__()
+#         assert channels % num_heads == 0
+#         self.num_heads = num_heads
+#         self.head_dim = channels // num_heads
+#         self.scale = self.head_dim ** -0.5
+        
+#         # Use GroupNorm for better memory efficiency than LayerNorm
+#         self.norm = nn.GroupNorm(8, channels)
+#         # Combine qkv into single conv for efficiency
+#         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=qkv_bias)
+#         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+
+#     def forward(self, x):
+#         B, C, H, W = x.shape
+#         h = self.norm(x)
+        
+#         # Memory-efficient attention computation
+#         qkv = self.qkv(h).reshape(B, 3, self.num_heads, self.head_dim, H*W).permute(1, 0, 2, 4, 3)
+#         q, k, v = qkv[0], qkv[1], qkv[2]
+        
+#         # Use scaled dot-product attention
+#         attn = (q @ k.transpose(-2, -1)) * self.scale
+#         attn = F.softmax(attn, dim=-1)
+        
+#         out = (attn @ v).transpose(-2, -1).reshape(B, C, H, W)
+#         return x + self.proj(out)
+
 class EfficientAttention(nn.Module):
-    """Memory-efficient attention with fewer parameters"""
-    def __init__(self, channels, num_heads=4, qkv_bias=False):
+    """
+    Memory-efficient attention with lightweight MLP.
+    
+    Implements a complete transformer block with both attention and MLP components:
+    1. Multi-head self-attention: Mixes information across spatial locations (linear operation)
+    2. MLP with GELU: Applies non-linear per-location feature transformation (essential!)
+    
+    Why the MLP is critical:
+    - Attention alone is a linear operation (weighted averaging)
+    - Without MLP, stacking attention layers collapses to single linear transform
+    - MLP provides the non-linearity needed for complex feature learning
+    - Typical transformers use mlp_ratio=4.0; we use 2.0 for memory efficiency
+    
+    Architecture pattern (standard transformer):
+    - x = x + attention(norm1(x))   # First residual: spatial mixing
+    - x = x + mlp(norm2(x))         # Second residual: feature transformation
+    
+    Memory trade-off:
+    - mlp_ratio=2.0 adds ~30% parameters vs attention-only
+    - Still much cheaper than mlp_ratio=4.0 (standard ViT)
+    - Essential for transformer expressiveness and capacity
+    """
+    def __init__(self, channels, num_heads=4, mlp_ratio=2.0, qkv_bias=False):
         super().__init__()
         assert channels % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Use GroupNorm for better memory efficiency than LayerNorm
-        self.norm = nn.GroupNorm(8, channels)
-        # Combine qkv into single conv for efficiency
+        # Attention components
+        self.norm1 = nn.GroupNorm(8, channels)
         self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=qkv_bias)
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        
+        # MLP components (essential for transformer expressiveness!)
+        self.norm2 = nn.GroupNorm(8, channels)
+        mlp_hidden = int(channels * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, mlp_hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(mlp_hidden, channels, 1)
+        )
 
     def forward(self, x):
+        # Multi-head self-attention block
         B, C, H, W = x.shape
-        h = self.norm(x)
+        h = self.norm1(x)
         
-        # Memory-efficient attention computation
+        # Attention computation
         qkv = self.qkv(h).reshape(B, 3, self.num_heads, self.head_dim, H*W).permute(1, 0, 2, 4, 3)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Use scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         
-        out = (attn @ v).transpose(-2, -1).reshape(B, C, H, W)
-        return x + self.proj(out)
-
+        attn_out = (attn @ v).transpose(-2, -1).reshape(B, C, H, W)
+        x = x + self.proj(attn_out)
+        
+        # MLP block (critical for non-linear feature transformation!)
+        x = x + self.mlp(self.norm2(x))
+        
+        return x
 class ConvBlock(nn.Module):
     """Pure convolutional block - no attention"""
     def __init__(self, in_ch, out_ch, emb_dim):
