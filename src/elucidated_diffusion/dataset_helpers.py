@@ -40,7 +40,7 @@ class LRHRDataset(Dataset):
         #return hr_img, cond_lr_up
         return hr_img, lr_img.squeeze(0)
     
-def get_datasets(experiment_name):
+def get_datasets(experiment_name,LR=LR,HR=HR):
     lr_transform = transforms.Compose([
             transforms.Resize((LR, LR)),
             transforms.ToTensor(),

@@ -191,6 +191,7 @@ class EfficientAttention(nn.Module):
         x = x + self.mlp(self.norm2(x))
         
         return x
+    
 class ConvBlock(nn.Module):
     """Pure convolutional block - no attention"""
     def __init__(self, in_ch, out_ch, emb_dim):
