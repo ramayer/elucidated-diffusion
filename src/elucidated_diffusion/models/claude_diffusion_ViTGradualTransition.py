@@ -346,6 +346,8 @@ def create_gradual_transition_unet(config='efficient'):
     'efficient': Optimized for 6GB GPU
     'balanced': More capacity, needs ~8GB
     'minimal': Very lightweight for 4GB GPU
+
+    This model at Balanced can draw beautiful new pokemon in 12 hours.
     """
     configs = {
         'minimal': {
