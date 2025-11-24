@@ -274,6 +274,7 @@ class SemanticCoordinatorUNetEinx(nn.Module):
         self.inject_16 = SemanticInjectorEinx(base_ch*4, base_ch*4)  # 256 -> 256  
         self.inject_32 = SemanticInjectorEinx(base_ch*4, base_ch*2)  # 256 -> 128
         self.inject_64 = SemanticInjectorEinx(base_ch*4, base_ch)    # 256 -> 64
+        self.inject_128 = SemanticInjectorEinx(base_ch*4, base_ch)   # 256 -> 64 (NEW!)
         
         # Decoder: Guided rendering
         # Channel counts made explicit with einx patterns
@@ -281,10 +282,19 @@ class SemanticCoordinatorUNetEinx(nn.Module):
         self.dec3 = ConvBlock(base_ch*4 + base_ch*4, base_ch*4, emb_dim)      # cat[256, 256]=512 -> 256
         self.dec2 = ConvBlock(base_ch*4 + base_ch*4, base_ch*2, emb_dim)      # cat[256, 256]=512 -> 128
         self.dec1 = ConvBlock(base_ch*2 + base_ch*2, base_ch, emb_dim)        # cat[128, 128]=256 -> 64
+        self.dec0 = ConvBlock(base_ch + base_ch, base_ch, emb_dim)            # cat[64, 64]=128 -> 64 (NEW!)
         
         # Pooling and upsampling
+        # Using learned upsampling (ConvTranspose2d) instead of bilinear interpolation
+        # to preserve pixel-level detail for diffusion models
         self.pool = nn.AvgPool2d(2)
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # Learned upsampling layers (one for each decoder level)
+        self.up4 = nn.ConvTranspose2d(base_ch*4, base_ch*4, kernel_size=2, stride=2)  # 4x4 -> 8x8
+        self.up3 = nn.ConvTranspose2d(base_ch*4, base_ch*4, kernel_size=2, stride=2)  # 8x8 -> 16x16
+        self.up2 = nn.ConvTranspose2d(base_ch*4, base_ch*4, kernel_size=2, stride=2)  # 16x16 -> 32x32
+        self.up1 = nn.ConvTranspose2d(base_ch*2, base_ch*2, kernel_size=2, stride=2)  # 32x32 -> 64x64
+        self.up0 = nn.ConvTranspose2d(base_ch, base_ch, kernel_size=2, stride=2)      # 64x64 -> 128x128
         
         # Output projection
         self.outc = nn.Conv2d(base_ch, out_channels, 1)
@@ -296,7 +306,6 @@ class SemanticCoordinatorUNetEinx(nn.Module):
         All concatenations, additions, and reshapes use einx patterns
         that make dimensions explicit and catch mismatches early.
         """
-        #print(x.shape)
         # Prepare time embedding
         if t.dim() == 1:
             t = t.float()
@@ -323,31 +332,35 @@ class SemanticCoordinatorUNetEinx(nn.Module):
         # DECODER: Semantically-guided rendering
         # ====================================================================
         # Strategy: Concatenate skip connections, decode, THEN inject semantic guidance
+        # Using learned upsampling (ConvTranspose2d) to preserve pixel-level detail
         
         # 8×8 level
-        d4 = self.up(semantic)  # [b, 256, 8, 8]
+        d4 = self.up4(semantic)  # [b, 256, 4, 4] -> [b, 256, 8, 8]
         d4 = self.dec4(torch.cat([d4, s1], dim=1), t_emb)  # cat[256, 256]=512 -> [b, 256, 8, 8]
         d4 = self.inject_8(d4, semantic, target_size=d4.shape[-2:])  # [b, 256, 8, 8] + inject
         
         # 16×16 level
-        d3 = self.up(d4)  # [b, 256, 16, 16]
+        d3 = self.up3(d4)  # [b, 256, 8, 8] -> [b, 256, 16, 16]
         d3 = self.dec3(torch.cat([d3, e4], dim=1), t_emb)  # cat[256, 256]=512 -> [b, 256, 16, 16]
         d3 = self.inject_16(d3, semantic, target_size=d3.shape[-2:])  # [b, 256, 16, 16] + inject
         
         # 32×32 level
-        d2 = self.up(d3)  # [b, 256, 32, 32]
+        d2 = self.up2(d3)  # [b, 256, 16, 16] -> [b, 256, 32, 32]
         d2 = self.dec2(torch.cat([d2, e3], dim=1), t_emb)  # cat[256, 256]=512 -> [b, 128, 32, 32]
         d2 = self.inject_32(d2, semantic, target_size=d2.shape[-2:])  # [b, 128, 32, 32] + inject
         
         # 64×64 level
-        d1 = self.up(d2)  # [b, 128, 64, 64]
+        d1 = self.up1(d2)  # [b, 128, 32, 32] -> [b, 128, 64, 64]
         d1 = self.dec1(torch.cat([d1, e2], dim=1), t_emb)  # cat[128, 128]=256 -> [b, 64, 64, 64]
         d1 = self.inject_64(d1, semantic, target_size=d1.shape[-2:])  # [b, 64, 64, 64] + inject
         
-        # Final upsample to input resolution
-        out = self.up(d1)  # [b, 64, 128, 128]
+        # 128×128 level (NEW - preserves pixel-level detail!)
+        d0 = self.up0(d1)  # [b, 64, 64, 64] -> [b, 64, 128, 128]
+        d0 = self.dec0(torch.cat([d0, e1], dim=1), t_emb)  # cat[64, 64]=128 -> [b, 64, 128, 128]
+        d0 = self.inject_128(d0, semantic, target_size=d0.shape[-2:])  # [b, 64, 128, 128] + inject
         
-        return self.outc(out)  # [b, 3, 128, 128]
+        # Output projection
+        return self.outc(d0)  # [b, 64, 128, 128] -> [b, 3, 128, 128]
 
 
 # Factory function
@@ -383,7 +396,7 @@ if __name__ == "__main__":
     print("Testing Semantic Coordinator with einx...")
     
     # Create model
-    model = create_semantic_coordinator_einx('efficient', img_size=128)
+    model = create_semantic_coordinator('efficient', img_size=128)
     
     # Test forward pass
     x = torch.randn(2, 3, 128, 128)
