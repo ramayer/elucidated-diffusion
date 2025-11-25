@@ -127,7 +127,38 @@ class MultiHeadAttention(nn.Module):
         )
         return self.proj(out)
 
+class AdaLN(nn.Module):
+    """Adaptive Layer Normalization - modulates features based on timestep"""
+    def __init__(self, channels, emb_dim):
+        super().__init__()
+        #self.norm = nn.GroupNorm(8, channels)
+        #self.ada_mlp = nn.Linear(emb_dim, channels * 2)  # scale + shift
 
+        self.norm = nn.GroupNorm(8, channels)
+        self.ada_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_dim, channels * 2)
+        )
+        
+        # CRITICAL: Initialize to near-identity
+        nn.init.zeros_(self.ada_mlp[-1].weight)  # ← Start with scale≈0, shift≈0
+        nn.init.zeros_(self.ada_mlp[-1].bias)
+    
+    def forward(self, x, t_emb):
+        # Normalize
+        x_norm = self.norm(x)
+        
+        # Get adaptive parameters from timestep
+        ada_params = self.ada_mlp(t_emb)  # [B, channels*2]
+        scale, shift = ada_params.chunk(2, dim=1)  # [B, channels] each
+        
+        # Reshape for broadcasting
+        scale = rearrange('b c -> b c 1 1', scale)
+        shift = rearrange('b c -> b c 1 1', shift)
+        
+        # Modulate: scale affects sensitivity, shift adds bias
+        return x_norm * (1 + scale) + shift
+    
 class ViTBlock(nn.Module):
     """
     Vision Transformer block - analogous to IT (Inferotemporal) cortex.
@@ -135,15 +166,24 @@ class ViTBlock(nn.Module):
     Stacking multiple ViT blocks = deeper semantic reasoning at same spatial scale.
     Like IT cortex: multiple processing stages for abstract understanding.
     """
-    def __init__(self, in_channels, out_channels, emb_dim, num_heads=8, mlp_ratio=2.0):
+    def __init__(self, in_channels, out_channels, emb_dim, num_heads=8, mlp_ratio=2.0, spatial_size=8):
         super().__init__()
         self.channel_proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
         self.time_mlp = nn.Linear(emb_dim, out_channels)
         
-        self.norm1 = nn.GroupNorm(8, out_channels)
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, out_channels, spatial_size, spatial_size) * 0.02
+        )
+
+        self.use_AdaLN = True
+        if self.use_AdaLN:
+            self.norm1 = AdaLN(out_channels, emb_dim)
+            self.norm2 = AdaLN(out_channels, emb_dim)
+        else: #group norm.
+            self.norm1 = nn.GroupNorm(8, out_channels)
+            self.norm2 = nn.GroupNorm(8, out_channels)
         self.attn = MultiHeadAttention(out_channels, num_heads)
         
-        self.norm2 = nn.GroupNorm(8, out_channels)
         mlp_hidden = int(out_channels * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Conv2d(out_channels, mlp_hidden, 1),
@@ -153,11 +193,16 @@ class ViTBlock(nn.Module):
 
     def forward(self, x, t_emb):
         x = self.channel_proj(x)
-
-        t_emb_spatial = rearrange('b c -> b c 1 1', self.time_mlp(t_emb))
-        x = add('b c h w, b c 1 1', x, t_emb_spatial)
-        x = add('b c h w, b c h w', x, self.attn(self.norm1(x)))
-        x = add('b c h w, b c h w', x, self.mlp(self.norm2(x)))
+        x = x + self.pos_embed
+        # AdaLN modulates based on timestep
+        if self.use_AdaLN:
+            x = x + self.attn(self.norm1(x, t_emb))  # ← Pass t_emb to norm
+            x = x + self.mlp(self.norm2(x, t_emb))   # ← Pass t_emb to norm
+        else:
+            t_emb_spatial = rearrange('b c -> b c 1 1', self.time_mlp(t_emb))
+            x = add('b c h w, b c 1 1', x, t_emb_spatial)
+            x = add('b c h w, b c h w', x, self.attn(self.norm1(x)))
+            x = add('b c h w, b c h w', x, self.mlp(self.norm2(x)))
         return x
 
 
@@ -359,7 +404,7 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
         for i in range(vit_layers):
             self.semantic_blocks.append(
                 ViTBlock(self.semantic_channels, self.semantic_channels, 
-                        emb_dim, num_heads=num_heads)
+                        emb_dim, num_heads=num_heads, spatial_size=semantic_resolution)
             )
         
         # ====================================================================
