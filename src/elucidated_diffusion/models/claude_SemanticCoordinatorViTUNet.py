@@ -311,15 +311,29 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
         # ENCODER: Looped Construction
         # ====================================================================
         
+        # Initial block at input resolution (provides skip connection for final decoder)
+        self.input_block = ConvBlock(in_channels, base_ch, emb_dim)
+        self.input_pool = nn.AvgPool2d(2)
+        
         self.encoder_blocks = nn.ModuleList()
         self.encoder_pools = nn.ModuleList()
         self.encoder_configs = []  # Track (channels, resolution) for decoder
         
-        current_ch = in_channels
-        current_res = img_size
+        # First config for input block
+        self.encoder_configs.append({
+            'channels': base_ch,
+            'resolution': img_size,
+            'index': -1  # Special index for input block
+        })
         
-        for i in range(cnn_layers):
-            out_ch = base_ch * (2 ** i)
+        current_ch = base_ch
+        current_res = img_size // 2  # After input_pool
+        
+        for i in range(cnn_layers - 1):  # -1 because input_block is first layer
+            out_ch = base_ch * (2 ** (i + 1))
+            out_ch = base_ch * (i + 1)**2 # Instead of esponentially growing channels quadratically
+            if out_ch > 512:
+                out_ch = 512
             self.encoder_blocks.append(ConvBlock(current_ch, out_ch, emb_dim))
             self.encoder_pools.append(nn.AvgPool2d(2))
             
@@ -364,12 +378,16 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
         self.decoder_ups = nn.ModuleList()
         self.decoder_blocks = nn.ModuleList()
         
-        # Build decoder in reverse order
-        for i in reversed(range(cnn_layers)):
+        # Build decoder in reverse order (including initial block)
+        for i in reversed(range(len(self.encoder_configs))):
             config = self.encoder_configs[i]
             
             # Upsample layer
-            in_ch = self.semantic_channels if i == cnn_layers - 1 else self.encoder_configs[i + 1]['channels']
+            if i == len(self.encoder_configs) - 1:
+                in_ch = self.semantic_channels
+            else:
+                in_ch = self.encoder_configs[i + 1]['channels']
+            
             self.decoder_ups.append(
                 nn.ConvTranspose2d(in_ch, config['channels'], kernel_size=2, stride=2)
             )
@@ -381,15 +399,8 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
                 ConvBlock(decoder_in_ch, decoder_out_ch, emb_dim)
             )
         
-        # Final upsample to input resolution (if we had any CNN layers)
-        if cnn_layers > 0:
-            final_ch = self.encoder_configs[0]['channels']
-            self.final_up = nn.ConvTranspose2d(final_ch, final_ch, kernel_size=2, stride=2)
-            self.final_block = ConvBlock(final_ch * 2, final_ch, emb_dim)
-            self.final_injector = SemanticInjector(self.semantic_channels, final_ch)
-        
         # Output projection
-        output_in_ch = self.encoder_configs[0]['channels'] if cnn_layers > 0 else self.semantic_channels
+        output_in_ch = base_ch  # First encoder config channels
         self.outc = nn.Conv2d(output_in_ch, out_channels, 1)
 
     def forward(self, x, t):
@@ -412,8 +423,13 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
         # ENCODER: Loop through CNN layers
         # ====================================================================
         encoder_features = []
-        h = x
         
+        # Initial block at input resolution
+        h = self.input_block(x, t_emb)  # [b, 3, 128, 128] -> [b, 64, 128, 128]
+        encoder_features.append(h)
+        h = self.input_pool(h)  # [b, 64, 64, 64]
+        
+        # Remaining encoder blocks
         for i, (block, pool) in enumerate(zip(self.encoder_blocks, self.encoder_pools)):
             h = block(h, t_emb)
             encoder_features.append(h)  # Store for skip connections
@@ -442,7 +458,7 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
             h = up(h)
             
             # Get corresponding encoder feature (reversed index)
-            encoder_idx = self.cnn_layers - 1 - i
+            encoder_idx = len(encoder_features) - 1 - i
             skip = encoder_features[encoder_idx]
             
             # Concatenate with skip connection
@@ -453,20 +469,6 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
             
             # Inject semantic guidance
             h = injector(h, semantic, target_size=h.shape[-2:])
-        
-        # ====================================================================
-        # FINAL LAYER: Upsample to input resolution
-        # ====================================================================
-        if self.cnn_layers > 0:
-            h = self.final_up(h)
-            # For the final layer, we need to handle the very first encoder output
-            # which is at the input resolution but before first pooling
-            # We need to create a matching feature at input resolution
-            # Actually, we need an encoder feature at input resolution - let's add it
-            # For now, just upsample and decode without skip at this level
-            # TODO: Add initial encoder feature at input resolution
-            h = self.final_block(torch.cat([h, h], dim=1), t_emb)  # Concatenate with itself for now
-            h = self.final_injector(h, semantic, target_size=h.shape[-2:])
         
         return self.outc(h)
 
