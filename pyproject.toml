@@ -15,7 +15,7 @@ dependencies = [
     'torchview',
     'objgraph',
     'einx',
-    'mlflow',
+    "mlflow",
 ]
 keywords = []
 authors = [

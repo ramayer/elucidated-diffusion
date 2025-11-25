@@ -150,9 +150,10 @@ class ViTBlock(nn.Module):
             nn.GELU(),
             nn.Conv2d(mlp_hidden, out_channels, 1)
         )
-        
+
     def forward(self, x, t_emb):
         x = self.channel_proj(x)
+
         t_emb_spatial = rearrange('b c -> b c 1 1', self.time_mlp(t_emb))
         x = add('b c h w, b c 1 1', x, t_emb_spatial)
         x = add('b c h w, b c h w', x, self.attn(self.norm1(x)))
