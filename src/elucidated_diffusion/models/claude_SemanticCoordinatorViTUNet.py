@@ -139,7 +139,10 @@ class AdaLN(nn.Module):
             nn.SiLU(),
             nn.Linear(emb_dim, channels * 2)
         )
-        
+
+        assert isinstance(self.ada_mlp[-1].weight, torch.Tensor) # just to make VS Code not complain
+        assert isinstance(self.ada_mlp[-1].bias, torch.Tensor) # just to make VS Code not complain
+
         # CRITICAL: Initialize to near-identity
         nn.init.zeros_(self.ada_mlp[-1].weight)  # ← Start with scale≈0, shift≈0
         nn.init.zeros_(self.ada_mlp[-1].bias)
@@ -155,7 +158,9 @@ class AdaLN(nn.Module):
         # Reshape for broadcasting
         scale = rearrange('b c -> b c 1 1', scale)
         shift = rearrange('b c -> b c 1 1', shift)
-        
+
+        assert isinstance(scale, torch.Tensor) # just to make VS Code not complain
+
         # Modulate: scale affects sensitivity, shift adds bias
         return x_norm * (1 + scale) + shift
     
@@ -509,7 +514,8 @@ class AdaptiveSemanticCoordinatorUNet(nn.Module):
             
             # Concatenate with skip connection
             h = torch.cat([h, skip], dim=1)
-            
+            # Interesting experiment - disable skip connections here
+            # h = torch.cat([h, torch.zeros_like(skip)], dim=1)
             # Decode
             h = block(h, t_emb)
             
@@ -566,7 +572,13 @@ def create_semantic_coordinator(img_size=128,
         'pure_cnn': {
             'cnn_layers': default_cnn_layers,
             'vit_layers': 0,
-            'base_ch': 64
+            'base_ch': 64,
+            'notes': """while the loss declines faster early 
+                        in training, and looks noticably 
+                        better in 5 hours of training,
+                        by 12 hours losses are ~20% worse 
+                        than 'bigger' and images are visibly worse
+                    """
         },
         'lightweight': {
             'cnn_layers': default_cnn_layers,
@@ -576,6 +588,11 @@ def create_semantic_coordinator(img_size=128,
         'balanced': {
             'cnn_layers': default_cnn_layers,
             'vit_layers': 3,
+            'base_ch': 64
+        },
+        'bigger': {
+            'cnn_layers': default_cnn_layers,
+            'vit_layers': 4,
             'base_ch': 64
         },
         'semantic_heavy': {
