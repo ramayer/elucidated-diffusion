@@ -16,6 +16,10 @@ A simple UNet diffusion model written by Github Copilot.
   * → Smooth nonlinearities, empirically better than ReLU in diffusion U-Nets.
 """
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 # -----------------------------
 # Positional embedding for timestep/sigma
 # -----------------------------
