@@ -20,15 +20,16 @@ class SinusoidalPosEmb(nn.Module):
 
 
 # -----------------------------
-# Windowed multi-head attention
+# Windowed multi-head attention with optional shifting (Swin style)
 # -----------------------------
 class WindowedAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, window_size=8):
+    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.window_size = window_size
+        self.shift_size = shift_size
         self.scale = self.head_dim ** -0.5
         
         self.qkv = nn.Linear(dim, dim * 3)
@@ -38,14 +39,24 @@ class WindowedAttention(nn.Module):
         # x: [B, H*W, C]
         B, N, C = x.shape
         ws = self.window_size
+        shift = self.shift_size
+        
+        # Reshape to spatial
+        x_spatial = rearrange('b (h w) c -> b h w c', x, h=h, w=w)
+        
+        # Cyclic shift if needed
+        if shift > 0:
+            x_spatial = torch.roll(x_spatial, shifts=(-shift, -shift), dims=(1, 2))
+        
+        x_windows = rearrange('b h w c -> b (h w) c', x_spatial)
         
         # Generate Q, K, V and split heads
-        qkv = self.qkv(x)  # [B, N, 3*C]
+        qkv = self.qkv(x_windows)
         qkv = rearrange('b (h w) (three nh dh) -> three b (h w) nh dh', 
                        qkv, three=3, nh=self.num_heads, dh=self.head_dim, h=h, w=w)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # Each is [B, H*W, num_heads, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]
         
-        # Reshape into windows: [B, H*W, nh, dh] -> [B, num_windows, nh, window_size^2, head_dim]
+        # Reshape into windows
         q = rearrange('b (h w) nh dh -> b h w nh dh', q, h=h, w=w)
         q = rearrange('b (nh ws1) (nw ws2) heads dh -> b (nh nw) heads (ws1 ws2) dh', 
                      q, ws1=ws, ws2=ws)
@@ -64,22 +75,27 @@ class WindowedAttention(nn.Module):
         
         out = dot('b w h n m, b w h m d -> b w h n d', attn, v)
         
-        # Reshape back: [B, num_windows, heads, window_size^2, head_dim] -> [B, H*W, C]
+        # Reshape back
         out = rearrange('b (nh nw) heads (ws1 ws2) dh -> b (nh ws1) (nw ws2) heads dh', 
                        out, nh=h//ws, nw=w//ws, ws1=ws, ws2=ws)
-        out = rearrange('b h w nh dh -> b (h w) (nh dh)', out)
+        out_spatial = rearrange('b h w nh dh -> b h w (nh dh)', out)
         
-        return x + self.proj(out)
+        # Reverse cyclic shift
+        if shift > 0:
+            out_spatial = torch.roll(out_spatial, shifts=(shift, shift), dims=(1, 2))
+        
+        out_flat = rearrange('b h w c -> b (h w) c', out_spatial)
+        return x + self.proj(out_flat)
 
 
 # -----------------------------
-# Transformer block with windowed attention
+# Transformer block with windowed attention and optional shifting
 # -----------------------------
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, window_size=8, mlp_ratio=4):
+    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0, mlp_ratio=4):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowedAttention(dim, num_heads, window_size)
+        self.attn = WindowedAttention(dim, num_heads, window_size, shift_size)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * mlp_ratio),
@@ -114,11 +130,16 @@ class PatchDiffusion(nn.Module):
             nn.GELU()
         )
         
-        # Transformer blocks with windowed attention
-        window_size = min(8, self.tokens_per_side)  # Adjust window size to resolution
+        # Transformer blocks with alternating regular/shifted windows (Swin style)
+        window_size = min(8, self.tokens_per_side)
         self.blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, window_size)
-            for _ in range(depth)
+            TransformerBlock(
+                dim, 
+                num_heads, 
+                window_size, 
+                shift_size=0 if i % 2 == 0 else window_size // 2
+            )
+            for i in range(depth)
         ])
         
         # Output projection
