@@ -1,5 +1,4 @@
-# v5
-
+#v7
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -206,11 +205,12 @@ class MultiScaleSharedViT(nn.Module):
         ])
         
         # Resolution-specific input/output projections
+        # First stage gets 3 channels (RGB), subsequent stages get 6 (noisy input + coarse prediction)
         self.patch_in = nn.ModuleDict({
             '32': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
-            '64': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
-            '128': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
-            '256': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+            '64': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
+            '128': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
+            '256': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
         })
         
         self.norm = nn.LayerNorm(dim)
@@ -275,33 +275,33 @@ class MultiScaleSharedViT(nn.Module):
         """Cascaded multi-scale processing: 32 → 64 → 128 → 256"""
         target_size = x.shape[-1]
         
-        # Stage 1: Generate base at 32x32
+        # Stage 1: Generate base at 32x32 (3 channels: noisy input)
         x_32 = F.interpolate(x, size=(32, 32), mode='bilinear', align_corners=False)
         out_32 = self.forward_single_scale(x_32, t, resolution=32)
         
         if target_size == 32:
             return out_32
         
-        # Stage 2: Refine at 64x64
+        # Stage 2: Refine at 64x64 (6 channels: noisy input + coarse prediction)
         x_64 = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
         out_32_up = F.interpolate(out_32, size=(64, 64), mode='bilinear', align_corners=False)
-        out_64 = self.forward_single_scale(x_64 + out_32_up, t, resolution=64)
+        out_64 = self.forward_single_scale(torch.cat([x_64, out_32_up], dim=1), t, resolution=64)
         
         if target_size == 64:
             return out_64
         
-        # Stage 3: Add details at 128x128
+        # Stage 3: Add details at 128x128 (6 channels: noisy input + coarse prediction)
         x_128 = F.interpolate(x, size=(128, 128), mode='bilinear', align_corners=False)
         out_64_up = F.interpolate(out_64, size=(128, 128), mode='bilinear', align_corners=False)
-        out_128 = self.forward_single_scale(x_128 + out_64_up, t, resolution=128)
+        out_128 = self.forward_single_scale(torch.cat([x_128, out_64_up], dim=1), t, resolution=128)
         
         if target_size == 128:
             return out_128
         
-        # Stage 4: Final details at 256x256
+        # Stage 4: Final details at 256x256 (6 channels: noisy input + coarse prediction)
         x_256 = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
         out_128_up = F.interpolate(out_128, size=(256, 256), mode='bilinear', align_corners=False)
-        out_256 = self.forward_single_scale(x_256 + out_128_up, t, resolution=256)
+        out_256 = self.forward_single_scale(torch.cat([x_256, out_128_up], dim=1), t, resolution=256)
         
         return out_256
 
