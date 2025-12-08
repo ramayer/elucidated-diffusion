@@ -1,5 +1,4 @@
-# v19 from https://claude.ai/chat/534494f4-2433-4ca2-b0bb-6e05f908c761
-# good semantic understanding, but very blocky checkerboard upscaling.
+#v2
 
 import torch
 import torch.nn as nn
@@ -23,7 +22,7 @@ class SinusoidalPosEmb(nn.Module):
 
 
 # -----------------------------
-# Relative positional bias
+# Relative positional bias (Swin-style)
 # -----------------------------
 class RelativePositionBias(nn.Module):
     def __init__(self, window_size, num_heads):
@@ -31,28 +30,35 @@ class RelativePositionBias(nn.Module):
         self.window_size = window_size
         self.num_heads = num_heads
         
+        # Relative position table: (2*window_size-1) × (2*window_size-1)
+        # For window_size=8: 15×15 = 225 possible relative positions
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
         )
         
+        # Pre-compute relative position indices
         coords_h = torch.arange(window_size)
         coords_w = torch.arange(window_size)
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
-        coords_flatten = torch.flatten(coords, 1)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # [2, ws, ws]
+        coords_flatten = torch.flatten(coords, 1)  # [2, ws*ws]
         
+        # Relative coordinates: [2, ws*ws, ws*ws]
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # [ws*ws, ws*ws, 2]
         
+        # Shift to start from 0
         relative_coords[:, :, 0] += window_size - 1
         relative_coords[:, :, 1] += window_size - 1
         relative_coords[:, :, 0] *= 2 * window_size - 1
         
-        relative_position_index = relative_coords.sum(-1)
+        relative_position_index = relative_coords.sum(-1)  # [ws*ws, ws*ws]
         self.register_buffer("relative_position_index", relative_position_index)
         
+        # Initialize bias with small values
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
     
     def forward(self):
+        # Get bias for this window: [ws*ws, ws*ws, num_heads]
         relative_position_bias = self.relative_position_bias_table[
             self.relative_position_index.view(-1)
         ].view(
@@ -60,11 +66,11 @@ class RelativePositionBias(nn.Module):
             self.window_size * self.window_size,
             -1
         )
-        return relative_position_bias.permute(2, 0, 1).contiguous()
+        return relative_position_bias.permute(2, 0, 1).contiguous()  # [num_heads, ws*ws, ws*ws]
 
 
 # -----------------------------
-# Windowed attention
+# Windowed multi-head attention with relative position bias
 # -----------------------------
 class WindowedAttention(nn.Module):
     def __init__(self, dim, num_heads=8, window_size=8, shift_size=0):
@@ -78,43 +84,31 @@ class WindowedAttention(nn.Module):
         
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
+        
+        # Relative position bias
         self.relative_position_bias = RelativePositionBias(window_size, num_heads)
     
     def forward(self, x, h, w):
         B, N, C = x.shape
+        ws = self.window_size
+        shift = self.shift_size
         
-        # Adjust window size if grid is smaller
-        ws = min(self.window_size, h, w)
-        shift = min(self.shift_size, ws // 2) if self.shift_size > 0 else 0
-        
-        # Full attention for very small grids
-        if h <= ws and w <= ws:
-            qkv = self.qkv(x)
-            qkv = rearrange('b n (three nh dh) -> three b nh n dh', 
-                           qkv, three=3, nh=self.num_heads, dh=self.head_dim)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-            
-            attn = dot('b nh n dh, b nh m dh -> b nh n m', q, k) * self.scale
-            attn = F.softmax(attn, dim=-1)
-            
-            out = dot('b nh n m, b nh m dh -> b nh n dh', attn, v)
-            out = rearrange('b nh n dh -> b n (nh dh)', out)
-            
-            return x + self.proj(out)
-        
-        # Windowed attention for larger grids
+        # Reshape to spatial
         x_spatial = rearrange('b (h w) c -> b h w c', x, h=h, w=w)
         
+        # Cyclic shift if needed
         if shift > 0:
             x_spatial = torch.roll(x_spatial, shifts=(-shift, -shift), dims=(1, 2))
         
         x_windows = rearrange('b h w c -> b (h w) c', x_spatial)
         
+        # Generate Q, K, V and split heads
         qkv = self.qkv(x_windows)
         qkv = rearrange('b (h w) (three nh dh) -> three b (h w) nh dh', 
                        qkv, three=3, nh=self.num_heads, dh=self.head_dim, h=h, w=w)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
+        # Reshape into windows
         q = rearrange('b (h w) nh dh -> b h w nh dh', q, h=h, w=w)
         q = rearrange('b (nh ws1) (nw ws2) heads dh -> b (nh nw) heads (ws1 ws2) dh', 
                      q, ws1=ws, ws2=ws)
@@ -127,17 +121,23 @@ class WindowedAttention(nn.Module):
         v = rearrange('b (nh ws1) (nw ws2) heads dh -> b (nh nw) heads (ws1 ws2) dh', 
                      v, ws1=ws, ws2=ws)
         
+        # Attention within windows with relative position bias
         attn = dot('b w h n d, b w h m d -> b w h n m', q, k) * self.scale
-        rel_pos_bias = self.relative_position_bias()
-        attn = attn + rel_pos_bias[None, None, :, :, :]
+        
+        # Add relative position bias: [num_heads, ws*ws, ws*ws]
+        rel_pos_bias = self.relative_position_bias()  # [nh, ws*ws, ws*ws]
+        attn = attn + rel_pos_bias[None, None, :, :, :]  # Broadcast to [B, num_windows, nh, ws*ws, ws*ws]
+        
         attn = F.softmax(attn, dim=-1)
         
         out = dot('b w h n m, b w h m d -> b w h n d', attn, v)
         
+        # Reshape back
         out = rearrange('b (nh nw) heads (ws1 ws2) dh -> b (nh ws1) (nw ws2) heads dh', 
                        out, nh=h//ws, nw=w//ws, ws1=ws, ws2=ws)
         out_spatial = rearrange('b h w nh dh -> b h w (nh dh)', out)
         
+        # Reverse cyclic shift
         if shift > 0:
             out_spatial = torch.roll(out_spatial, shifts=(shift, shift), dims=(1, 2))
         
@@ -146,43 +146,7 @@ class WindowedAttention(nn.Module):
 
 
 # -----------------------------
-# Cross-attention for semantic injection
-# -----------------------------
-class SemanticCrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=8):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-        
-        self.to_q = nn.Linear(dim, dim)
-        self.to_kv = nn.Linear(dim, dim * 2)
-        self.proj = nn.Linear(dim, dim)
-    
-    def forward(self, x, semantic_tokens):
-        B, N, C = x.shape
-        
-        q = self.to_q(self.norm_q(x))
-        k, v = self.to_kv(self.norm_kv(semantic_tokens)).chunk(2, dim=-1)
-        
-        q = rearrange('b n (nh dh) -> b nh n dh', q, nh=self.num_heads, dh=self.head_dim)
-        k = rearrange('b m (nh dh) -> b nh m dh', k, nh=self.num_heads, dh=self.head_dim)
-        v = rearrange('b m (nh dh) -> b nh m dh', v, nh=self.num_heads, dh=self.head_dim)
-        
-        attn = dot('b nh n dh, b nh m dh -> b nh n m', q, k) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        
-        out = dot('b nh n m, b nh m dh -> b nh n dh', attn, v)
-        out = rearrange('b nh n dh -> b n (nh dh)', out)
-        
-        return x + self.proj(out)
-
-
-# -----------------------------
-# Transformer block
+# Transformer block with windowed attention
 # -----------------------------
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads=8, window_size=8, shift_size=0, mlp_ratio=4):
@@ -203,197 +167,156 @@ class TransformerBlock(nn.Module):
 
 
 # -----------------------------
-# Single resolution processor
+# Multi-scale shared transformer with hybrid positional encoding
 # -----------------------------
-class ResolutionProcessor(nn.Module):
-    def __init__(self, in_channels, dim, depth, num_heads, patch_size, max_tokens):
-        super().__init__()
-        self.patch_size = patch_size
-        
-        # Input
-        self.patch_in = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
-        
-        # Learnable absolute position (aspect-ratio flexible via slicing)
-        self.abs_pos_embed = nn.Parameter(torch.randn(1, max_tokens, dim) * 0.02)
-        
-        # Semantic cross-attention
-        self.semantic_cross_attn = SemanticCrossAttention(dim, num_heads)
-        
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads, window_size=8, shift_size=0 if i % 2 == 0 else 4)
-            for i in range(depth)
-        ])
-        
-        # Output
-        self.norm = nn.LayerNorm(dim)
-        self.patch_out = nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size)
-    
-    def forward(self, x, t_emb, scale_emb, coarse_semantics):
-        B = x.shape[0]
-        
-        # Patchify
-        tokens = self.patch_in(x)
-        h, w = tokens.shape[2], tokens.shape[3]
-        tokens = rearrange('b c h w -> b (h w) c', tokens)
-        num_tokens = h * w
-        
-        # Add embeddings
-        tokens = tokens + t_emb[:, None, :] + scale_emb
-        
-        # Add positional embedding (slice to actual grid size for aspect ratios)
-        if num_tokens <= self.abs_pos_embed.shape[1]:
-            tokens = tokens + self.abs_pos_embed[:, :num_tokens, :]
-        else:
-            # Interpolate if somehow we have more tokens than expected (shouldn't happen)
-            pos = F.interpolate(
-                self.abs_pos_embed.permute(0, 2, 1),
-                size=num_tokens,
-                mode='linear'
-            ).permute(0, 2, 1)
-            tokens = tokens + pos
-        
-        # Inject coarse semantics
-        tokens = self.semantic_cross_attn(tokens, coarse_semantics)
-        
-        # Transformer blocks
-        for block in self.blocks:
-            tokens = block(tokens, h, w)
-        
-        # Output
-        semantic_tokens = self.norm(tokens)
-        tokens_spatial = rearrange('b (h w) c -> b c h w', semantic_tokens, h=h, w=w)
-        pixels = self.patch_out(tokens_spatial)
-        
-        return pixels, semantic_tokens
-
-
-# -----------------------------
-# Semantic cascade ViT (back to basics)
-# -----------------------------
-class SemanticCascadeViT(nn.Module):
-    def __init__(self, dim=384, depth=3, num_heads=6, patch_size=4, share_weights=True):
-        """
-        Power-of-2 cascade: input_size / 4 → input_size / 2 → input_size
-        Examples:
-          - 32×32: 8×8 → 16×16 → 32×32
-          - 128×128: 32×32 → 64×64 → 128×128
-          - 640×64: 160×16 → 320×32 → 640×64 (aspect-ratio preserved!)
-        """
+class MultiScaleSharedViT(nn.Module):
+    def __init__(self, dim=512, depth=6, num_heads=8, patch_size=4):
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
-        self.share_weights = share_weights
         
-        # Default unconditional semantic token
-        self.default_semantic_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        
-        # Time embedding (always shared)
+        # Time embedding
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(dim),
             nn.Linear(dim, dim),
             nn.GELU()
         )
         
-        # Scale embeddings (coarse, medium, fine)
-        self.scale_embed_coarse = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.scale_embed_medium = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.scale_embed_fine = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        # Scale-specific embeddings (learnable)
+        self.scale_embed_32 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.scale_embed_64 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.scale_embed_128 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.scale_embed_256 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         
-        if share_weights:
-            # ONE processor for all resolutions (shared weights)
-            # Max tokens: 128×128 / 4 patch = 32×32 = 1024 tokens
-            self.processor = ResolutionProcessor(
-                in_channels=6,  # Always 6 (handles first stage via zeros)
-                dim=dim,
-                depth=depth,
-                num_heads=num_heads,
-                patch_size=patch_size,
-                max_tokens=1024
+        # Absolute positional embeddings for global layout understanding
+        # Only at coarse scales where global structure matters
+        self.abs_pos_embed_32 = nn.Parameter(torch.randn(1, 64, dim) * 0.02)    # 8×8 tokens
+        self.abs_pos_embed_64 = nn.Parameter(torch.randn(1, 256, dim) * 0.02)   # 16×16 tokens
+        self.abs_pos_embed_128 = nn.Parameter(torch.randn(1, 1024, dim) * 0.02) # 32×32 tokens
+        self.abs_pos_embed_256 = nn.Parameter(torch.randn(1, 4096, dim) * 0.02) # 64×64 tokens
+        
+        # Shared transformer blocks with relative position bias
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                dim, 
+                num_heads=num_heads, 
+                window_size=8,
+                shift_size=0 if i % 2 == 0 else 4
             )
-        else:
-            # Separate processors per resolution (more capacity)
-            self.processor_coarse = ResolutionProcessor(3, dim, depth, num_heads, patch_size, 1024)
-            self.processor_medium = ResolutionProcessor(6, dim, depth, num_heads, patch_size, 4096)
-            self.processor_fine = ResolutionProcessor(6, dim, depth+2, num_heads, patch_size, 16384)
-    
-    def process_resolution(self, x, t_emb, scale_emb, coarse_semantics, stage):
-        """Process at one resolution"""
-        if self.share_weights:
-            # Pad first stage to 6 channels
-            if x.shape[1] == 3:
-                x = torch.cat([x, torch.zeros_like(x)], dim=1)
-            return self.processor(x, t_emb, scale_emb, coarse_semantics)
-        else:
-            # Use appropriate processor
-            if stage == 0:
-                return self.processor_coarse(x, t_emb, scale_emb, coarse_semantics)
-            elif stage == 1:
-                return self.processor_medium(x, t_emb, scale_emb, coarse_semantics)
-            else:
-                return self.processor_fine(x, t_emb, scale_emb, coarse_semantics)
-    
-    def upsample_semantics(self, semantic_tokens, from_h, from_w, to_h, to_w):
-        """Upsample semantic tokens (nearest neighbor)"""
-        B, N, C = semantic_tokens.shape
-        tokens_spatial = rearrange('b (h w) c -> b c h w', semantic_tokens, h=from_h, w=from_w)
-        tokens_up = F.interpolate(tokens_spatial, size=(to_h, to_w), mode='nearest')
-        return rearrange('b c h w -> b (h w) c', tokens_up)
-    
-    def forward(self, x, t, global_conditioning=None):
-        """
-        x: [B, 3, H, W] - input at any resolution
-        t: [B] or [B, 1] - timestep
-        global_conditioning: [B, M, dim] - optional conditioning
-        """
-        B, C, H, W = x.shape
+            for i in range(depth)
+        ])
         
-        # Prepare timestep
+        # Resolution-specific input/output projections
+        self.patch_in = nn.ModuleDict({
+            '32': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+            '64': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+            '128': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+            '256': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+        })
+        
+        self.norm = nn.LayerNorm(dim)
+        
+        self.patch_out = nn.ModuleDict({
+            '32': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
+            '64': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
+            '128': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
+            '256': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
+        })
+        
+        # Map for embeddings
+        self.scale_embeds = {
+            32: self.scale_embed_32,
+            64: self.scale_embed_64,
+            128: self.scale_embed_128,
+            256: self.scale_embed_256,
+        }
+        
+        self.abs_pos_embeds = {
+            32: self.abs_pos_embed_32,
+            64: self.abs_pos_embed_64,
+            128: self.abs_pos_embed_128,
+            256: self.abs_pos_embed_256,
+        }
+    
+    def forward_single_scale(self, x, t, resolution):
+        """Process at a single resolution using shared transformer"""
+        B = x.shape[0]
+        res_str = str(resolution)
+        
+        # Time embedding
+        t_emb = self.time_embed(t)  # [B, dim]
+        
+        # Patchify
+        tokens = self.patch_in[res_str](x)  # [B, dim, h, w]
+        h, w = tokens.shape[2], tokens.shape[3]
+        tokens = rearrange('b c h w -> b (h w) c', tokens)
+        
+        # Add embeddings:
+        # 1. Time embedding (what timestep are we at?)
+        # 2. Scale embedding (what resolution level are we at?)
+        # 3. Absolute position embedding (where in the image is this token?)
+        tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution] + self.abs_pos_embeds[resolution]
+        
+        # Shared transformer blocks (with relative position bias inside)
+        for block in self.blocks:
+            tokens = block(tokens, h, w)
+        
+        # Normalize and unpatchify
+        tokens = self.norm(tokens)
+        tokens = rearrange('b (h w) c -> b c h w', tokens, h=h, w=w)
+        out = self.patch_out[res_str](tokens)
+        
+        return out
+    
+    def forward(self, x, t):
+        """Cascaded multi-scale processing: 32 → 64 → 128 → 256"""
+        target_size = x.shape[-1]
+        
+        # Stage 1: Generate base at 32x32
+        x_32 = F.interpolate(x, size=(32, 32), mode='bilinear', align_corners=False)
+        out_32 = self.forward_single_scale(x_32, t, resolution=32)
+        
+        if target_size == 32:
+            return out_32
+        
+        # Stage 2: Refine at 64x64
+        x_64 = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
+        out_32_up = F.interpolate(out_32, size=(64, 64), mode='bilinear', align_corners=False)
+        out_64 = self.forward_single_scale(x_64 + out_32_up, t, resolution=64)
+        
+        if target_size == 64:
+            return out_64
+        
+        # Stage 3: Add details at 128x128
+        x_128 = F.interpolate(x, size=(128, 128), mode='bilinear', align_corners=False)
+        out_64_up = F.interpolate(out_64, size=(128, 128), mode='bilinear', align_corners=False)
+        out_128 = self.forward_single_scale(x_128 + out_64_up, t, resolution=128)
+        
+        if target_size == 128:
+            return out_128
+        
+        # Stage 4: Final details at 256x256
+        x_256 = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
+        out_128_up = F.interpolate(out_128, size=(256, 256), mode='bilinear', align_corners=False)
+        out_256 = self.forward_single_scale(x_256 + out_128_up, t, resolution=256)
+        
+        return out_256
+
+
+# -----------------------------
+# Convenience wrapper
+# -----------------------------
+class UNet128(nn.Module):
+    """Drop-in replacement for training code that expects UNet128"""
+    def __init__(self, in_channels=3, base_ch=64, emb_dim=128):
+        super().__init__()
+        # Map base_ch to embedding dim: base_ch=64 -> dim=512
+        dim = base_ch * 8
+        self.model = MultiScaleSharedViT(dim=dim, depth=6, num_heads=8)
+    
+    def forward(self, x, t):
         if t.dim() == 1:
             t = t.float()
         else:
             t = t.squeeze(-1).float()
-        t_emb = self.time_embed(t)
-        
-        # Use provided conditioning or default
-        if global_conditioning is None:
-            global_conditioning = self.default_semantic_token.expand(B, -1, -1)
-        
-        # Stage 0: Coarse (input_size / 4)
-        h_coarse, w_coarse = H // 4, W // 4
-        x_coarse = F.interpolate(x, size=(h_coarse, w_coarse), mode='bilinear', align_corners=False)
-        out_coarse, sem_coarse = self.process_resolution(
-            x_coarse, t_emb, self.scale_embed_coarse, global_conditioning, stage=0
-        )
-        
-        # Stage 1: Medium (input_size / 2)
-        h_medium, w_medium = H // 2, W // 2
-        x_medium = F.interpolate(x, size=(h_medium, w_medium), mode='bilinear', align_corners=False)
-        out_coarse_up = F.interpolate(out_coarse, size=(h_medium, w_medium), mode='bilinear', align_corners=False)
-        
-        tokens_h_coarse = h_coarse // self.patch_size
-        tokens_w_coarse = w_coarse // self.patch_size
-        tokens_h_medium = h_medium // self.patch_size
-        tokens_w_medium = w_medium // self.patch_size
-        sem_coarse_up = self.upsample_semantics(sem_coarse, tokens_h_coarse, tokens_w_coarse, 
-                                                tokens_h_medium, tokens_w_medium)
-        
-        out_medium, sem_medium = self.process_resolution(
-            torch.cat([x_medium, out_coarse_up], dim=1),
-            t_emb, self.scale_embed_medium, sem_coarse_up, stage=1
-        )
-        
-        # Stage 2: Fine (input_size / 1)
-        out_medium_up = F.interpolate(out_medium, size=(H, W), mode='bilinear', align_corners=False)
-        
-        tokens_h_fine = H // self.patch_size
-        tokens_w_fine = W // self.patch_size
-        sem_medium_up = self.upsample_semantics(sem_medium, tokens_h_medium, tokens_w_medium,
-                                                tokens_h_fine, tokens_w_fine)
-        
-        out_fine, _ = self.process_resolution(
-            torch.cat([x, out_medium_up], dim=1),
-            t_emb, self.scale_embed_fine, sem_medium_up, stage=2
-        )
-        
-        return out_fine
+        return self.model(x, t)
