@@ -1,3 +1,6 @@
+# v19 from https://claude.ai/chat/534494f4-2433-4ca2-b0bb-6e05f908c761
+# good semantic understanding, but very blocky checkerboard upscaling.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,9 +82,27 @@ class WindowedAttention(nn.Module):
     
     def forward(self, x, h, w):
         B, N, C = x.shape
-        ws = self.window_size
-        shift = self.shift_size
         
+        # Adjust window size if grid is smaller
+        ws = min(self.window_size, h, w)
+        shift = min(self.shift_size, ws // 2) if self.shift_size > 0 else 0
+        
+        # Full attention for very small grids
+        if h <= ws and w <= ws:
+            qkv = self.qkv(x)
+            qkv = rearrange('b n (three nh dh) -> three b nh n dh', 
+                           qkv, three=3, nh=self.num_heads, dh=self.head_dim)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            
+            attn = dot('b nh n dh, b nh m dh -> b nh n m', q, k) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            
+            out = dot('b nh n m, b nh m dh -> b nh n dh', attn, v)
+            out = rearrange('b nh n dh -> b n (nh dh)', out)
+            
+            return x + self.proj(out)
+        
+        # Windowed attention for larger grids
         x_spatial = rearrange('b (h w) c -> b h w c', x, h=h, w=w)
         
         if shift > 0:
@@ -128,7 +149,6 @@ class WindowedAttention(nn.Module):
 # Cross-attention for semantic injection
 # -----------------------------
 class SemanticCrossAttention(nn.Module):
-    """Fine tokens query coarse semantic tokens"""
     def __init__(self, dim, num_heads=8):
         super().__init__()
         self.num_heads = num_heads
@@ -183,158 +203,152 @@ class TransformerBlock(nn.Module):
 
 
 # -----------------------------
-# Shared-weight cascaded ViT with semantic flow
+# Single resolution processor
+# -----------------------------
+class ResolutionProcessor(nn.Module):
+    def __init__(self, in_channels, dim, depth, num_heads, patch_size, max_tokens):
+        super().__init__()
+        self.patch_size = patch_size
+        
+        # Input
+        self.patch_in = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        
+        # Learnable absolute position (aspect-ratio flexible via slicing)
+        self.abs_pos_embed = nn.Parameter(torch.randn(1, max_tokens, dim) * 0.02)
+        
+        # Semantic cross-attention
+        self.semantic_cross_attn = SemanticCrossAttention(dim, num_heads)
+        
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads, window_size=8, shift_size=0 if i % 2 == 0 else 4)
+            for i in range(depth)
+        ])
+        
+        # Output
+        self.norm = nn.LayerNorm(dim)
+        self.patch_out = nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size)
+    
+    def forward(self, x, t_emb, scale_emb, coarse_semantics):
+        B = x.shape[0]
+        
+        # Patchify
+        tokens = self.patch_in(x)
+        h, w = tokens.shape[2], tokens.shape[3]
+        tokens = rearrange('b c h w -> b (h w) c', tokens)
+        num_tokens = h * w
+        
+        # Add embeddings
+        tokens = tokens + t_emb[:, None, :] + scale_emb
+        
+        # Add positional embedding (slice to actual grid size for aspect ratios)
+        if num_tokens <= self.abs_pos_embed.shape[1]:
+            tokens = tokens + self.abs_pos_embed[:, :num_tokens, :]
+        else:
+            # Interpolate if somehow we have more tokens than expected (shouldn't happen)
+            pos = F.interpolate(
+                self.abs_pos_embed.permute(0, 2, 1),
+                size=num_tokens,
+                mode='linear'
+            ).permute(0, 2, 1)
+            tokens = tokens + pos
+        
+        # Inject coarse semantics
+        tokens = self.semantic_cross_attn(tokens, coarse_semantics)
+        
+        # Transformer blocks
+        for block in self.blocks:
+            tokens = block(tokens, h, w)
+        
+        # Output
+        semantic_tokens = self.norm(tokens)
+        tokens_spatial = rearrange('b (h w) c -> b c h w', semantic_tokens, h=h, w=w)
+        pixels = self.patch_out(tokens_spatial)
+        
+        return pixels, semantic_tokens
+
+
+# -----------------------------
+# Semantic cascade ViT (back to basics)
 # -----------------------------
 class SemanticCascadeViT(nn.Module):
-    def __init__(self, dim=384, depth=3, num_heads=6, patch_size=4):
+    def __init__(self, dim=384, depth=3, num_heads=6, patch_size=4, share_weights=True):
+        """
+        Power-of-2 cascade: input_size / 4 → input_size / 2 → input_size
+        Examples:
+          - 32×32: 8×8 → 16×16 → 32×32
+          - 128×128: 32×32 → 64×64 → 128×128
+          - 640×64: 160×16 → 320×32 → 640×64 (aspect-ratio preserved!)
+        """
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
+        self.share_weights = share_weights
         
         # Default unconditional semantic token
         self.default_semantic_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         
-        # Time embedding (shared across all stages)
+        # Time embedding (always shared)
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(dim),
             nn.Linear(dim, dim),
             nn.GELU()
         )
         
-        # Scale-specific embeddings (tells model what resolution it's processing)
-        self.scale_embed_32 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.scale_embed_64 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.scale_embed_128 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        self.scale_embed_256 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        # Scale embeddings (coarse, medium, fine)
+        self.scale_embed_coarse = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.scale_embed_medium = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.scale_embed_fine = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         
-        # Absolute positional embeddings (only at coarse scales)
-        self.abs_pos_embed_32 = nn.Parameter(torch.randn(1, 64, dim) * 0.02)   # 8×8
-        self.abs_pos_embed_64 = nn.Parameter(torch.randn(1, 256, dim) * 0.02)  # 16×16
-        
-        # Resolution-specific patch embeddings (input layer)
-        self.patch_in = nn.ModuleDict({
-            '32': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
-            '64': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
-            '128': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
-            '256': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
-        })
-        
-        # SHARED semantic cross-attention (same weights for all scales)
-        self.semantic_cross_attn = SemanticCrossAttention(dim, num_heads)
-        
-        # SHARED transformer blocks (same weights for all scales)
-        # Base depth for 32/64/128, extra blocks for 256
-        self.shared_blocks = nn.ModuleList([
-            TransformerBlock(
-                dim, 
-                num_heads, 
-                window_size=8,
-                shift_size=0 if i % 2 == 0 else 4
+        if share_weights:
+            # ONE processor for all resolutions (shared weights)
+            # Max tokens: 128×128 / 4 patch = 32×32 = 1024 tokens
+            self.processor = ResolutionProcessor(
+                in_channels=6,  # Always 6 (handles first stage via zeros)
+                dim=dim,
+                depth=depth,
+                num_heads=num_heads,
+                patch_size=patch_size,
+                max_tokens=1024
             )
-            for i in range(depth)
-        ])
-        
-        # Extra blocks for 256×256 (needs more depth for fine details)
-        self.extra_blocks_256 = nn.ModuleList([
-            TransformerBlock(dim, num_heads, window_size=8, shift_size=0 if i % 2 == 0 else 4)
-            for i in range(2)
-        ])
-        
-        # SHARED output normalization
-        self.norm = nn.LayerNorm(dim)
-        
-        # Resolution-specific unpatch layers (output layer)
-        self.patch_out = nn.ModuleDict({
-            '32': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
-            '64': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
-            '128': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
-            '256': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
-        })
-        
-        # Helper dicts
-        self.scale_embeds = {
-            32: self.scale_embed_32,
-            64: self.scale_embed_64,
-            128: self.scale_embed_128,
-            256: self.scale_embed_256,
-        }
-        
-        self.abs_pos_embeds = {
-            32: self.abs_pos_embed_32,
-            64: self.abs_pos_embed_64,
-            128: None,
-            256: None,
-        }
+        else:
+            # Separate processors per resolution (more capacity)
+            self.processor_coarse = ResolutionProcessor(3, dim, depth, num_heads, patch_size, 1024)
+            self.processor_medium = ResolutionProcessor(6, dim, depth, num_heads, patch_size, 4096)
+            self.processor_fine = ResolutionProcessor(6, dim, depth+2, num_heads, patch_size, 16384)
     
-    def process_at_resolution(self, x, t, resolution, coarse_semantics, use_extra_blocks=False):
-        """
-        Process tokens at a given resolution using SHARED transformer weights
-        x: input pixels
-        t: timestep (already embedded)
-        resolution: 32, 64, 128, or 256
-        coarse_semantics: semantic tokens from previous stage
-        use_extra_blocks: use extra depth for 256×256
-        Returns: (pixels, semantic_tokens)
-        """
-        B = x.shape[0]
-        res_str = str(resolution)
-        tokens_per_side = resolution // self.patch_size
-        
-        # Patchify
-        tokens = self.patch_in[res_str](x)
-        h, w = tokens.shape[2], tokens.shape[3]
-        tokens = rearrange('b c h w -> b (h w) c', tokens)
-        
-        # Add embeddings
-        tokens = tokens + t[:, None, :]  # Time
-        tokens = tokens + self.scale_embeds[resolution]  # Scale
-        if self.abs_pos_embeds[resolution] is not None:
-            tokens = tokens + self.abs_pos_embeds[resolution]  # Absolute position
-        
-        # Inject coarse semantics
-        tokens = self.semantic_cross_attn(tokens, coarse_semantics)
-        
-        # SHARED transformer blocks
-        for block in self.shared_blocks:
-            tokens = block(tokens, h, w)
-        
-        # Extra blocks for 256×256
-        if use_extra_blocks:
-            for block in self.extra_blocks_256:
-                tokens = block(tokens, h, w)
-        
-        # Normalize
-        semantic_tokens = self.norm(tokens)
-        
-        # Convert to pixels
-        tokens_spatial = rearrange('b (h w) c -> b c h w', semantic_tokens, h=h, w=w)
-        pixels = self.patch_out[res_str](tokens_spatial)
-        
-        return pixels, semantic_tokens
+    def process_resolution(self, x, t_emb, scale_emb, coarse_semantics, stage):
+        """Process at one resolution"""
+        if self.share_weights:
+            # Pad first stage to 6 channels
+            if x.shape[1] == 3:
+                x = torch.cat([x, torch.zeros_like(x)], dim=1)
+            return self.processor(x, t_emb, scale_emb, coarse_semantics)
+        else:
+            # Use appropriate processor
+            if stage == 0:
+                return self.processor_coarse(x, t_emb, scale_emb, coarse_semantics)
+            elif stage == 1:
+                return self.processor_medium(x, t_emb, scale_emb, coarse_semantics)
+            else:
+                return self.processor_fine(x, t_emb, scale_emb, coarse_semantics)
     
-    def upsample_semantics(self, semantic_tokens, from_size, to_size):
-        """Upsample semantic token grid via nearest neighbor"""
+    def upsample_semantics(self, semantic_tokens, from_h, from_w, to_h, to_w):
+        """Upsample semantic tokens (nearest neighbor)"""
         B, N, C = semantic_tokens.shape
-        from_h = from_w = int(N ** 0.5)
-        to_h = to_w = to_size // self.patch_size
-        
         tokens_spatial = rearrange('b (h w) c -> b c h w', semantic_tokens, h=from_h, w=from_w)
         tokens_up = F.interpolate(tokens_spatial, size=(to_h, to_w), mode='nearest')
-        tokens_up_flat = rearrange('b c h w -> b (h w) c', tokens_up)
-        
-        return tokens_up_flat
+        return rearrange('b c h w -> b (h w) c', tokens_up)
     
     def forward(self, x, t, global_conditioning=None):
         """
-        x: [B, 3, H, W] - noisy input image (H, W ∈ {32, 64, 128, 256})
+        x: [B, 3, H, W] - input at any resolution
         t: [B] or [B, 1] - timestep
-        global_conditioning: [B, M, dim] - optional semantic conditioning
-        Returns: [B, 3, H, W] - denoised image
+        global_conditioning: [B, M, dim] - optional conditioning
         """
-        B = x.shape[0]
-        target_size = x.shape[-1]
+        B, C, H, W = x.shape
         
-        # Prepare timestep embedding
+        # Prepare timestep
         if t.dim() == 1:
             t = t.float()
         else:
@@ -345,44 +359,41 @@ class SemanticCascadeViT(nn.Module):
         if global_conditioning is None:
             global_conditioning = self.default_semantic_token.expand(B, -1, -1)
         
-        # Stage 1: 32×32
-        x_32 = F.interpolate(x, size=(32, 32), mode='bilinear', align_corners=False)
-        out_32, sem_32 = self.process_at_resolution(
-            x_32, t_emb, 32, coarse_semantics=global_conditioning
+        # Stage 0: Coarse (input_size / 4)
+        h_coarse, w_coarse = H // 4, W // 4
+        x_coarse = F.interpolate(x, size=(h_coarse, w_coarse), mode='bilinear', align_corners=False)
+        out_coarse, sem_coarse = self.process_resolution(
+            x_coarse, t_emb, self.scale_embed_coarse, global_conditioning, stage=0
         )
         
-        if target_size == 32:
-            return out_32
+        # Stage 1: Medium (input_size / 2)
+        h_medium, w_medium = H // 2, W // 2
+        x_medium = F.interpolate(x, size=(h_medium, w_medium), mode='bilinear', align_corners=False)
+        out_coarse_up = F.interpolate(out_coarse, size=(h_medium, w_medium), mode='bilinear', align_corners=False)
         
-        # Stage 2: 64×64
-        x_64 = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
-        out_32_up = F.interpolate(out_32, size=(64, 64), mode='bilinear', align_corners=False)
-        sem_32_up = self.upsample_semantics(sem_32, 32, 64)
-        out_64, sem_64 = self.process_at_resolution(
-            torch.cat([x_64, out_32_up], dim=1), t_emb, 64, coarse_semantics=sem_32_up
+        tokens_h_coarse = h_coarse // self.patch_size
+        tokens_w_coarse = w_coarse // self.patch_size
+        tokens_h_medium = h_medium // self.patch_size
+        tokens_w_medium = w_medium // self.patch_size
+        sem_coarse_up = self.upsample_semantics(sem_coarse, tokens_h_coarse, tokens_w_coarse, 
+                                                tokens_h_medium, tokens_w_medium)
+        
+        out_medium, sem_medium = self.process_resolution(
+            torch.cat([x_medium, out_coarse_up], dim=1),
+            t_emb, self.scale_embed_medium, sem_coarse_up, stage=1
         )
         
-        if target_size == 64:
-            return out_64
+        # Stage 2: Fine (input_size / 1)
+        out_medium_up = F.interpolate(out_medium, size=(H, W), mode='bilinear', align_corners=False)
         
-        # Stage 3: 128×128
-        x_128 = F.interpolate(x, size=(128, 128), mode='bilinear', align_corners=False)
-        out_64_up = F.interpolate(out_64, size=(128, 128), mode='bilinear', align_corners=False)
-        sem_64_up = self.upsample_semantics(sem_64, 64, 128)
-        out_128, sem_128 = self.process_at_resolution(
-            torch.cat([x_128, out_64_up], dim=1), t_emb, 128, coarse_semantics=sem_64_up
+        tokens_h_fine = H // self.patch_size
+        tokens_w_fine = W // self.patch_size
+        sem_medium_up = self.upsample_semantics(sem_medium, tokens_h_medium, tokens_w_medium,
+                                                tokens_h_fine, tokens_w_fine)
+        
+        out_fine, _ = self.process_resolution(
+            torch.cat([x, out_medium_up], dim=1),
+            t_emb, self.scale_embed_fine, sem_medium_up, stage=2
         )
         
-        if target_size == 128:
-            return out_128
-        
-        # Stage 4: 256×256 (with extra depth)
-        x_256 = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
-        out_128_up = F.interpolate(out_128, size=(256, 256), mode='bilinear', align_corners=False)
-        sem_128_up = self.upsample_semantics(sem_128, 128, 256)
-        out_256, _ = self.process_at_resolution(
-            torch.cat([x_256, out_128_up], dim=1), t_emb, 256, 
-            coarse_semantics=sem_128_up, use_extra_blocks=True
-        )
-        
-        return out_256
+        return out_fine
