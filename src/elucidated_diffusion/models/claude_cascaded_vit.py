@@ -1,4 +1,3 @@
-#v7
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,55 +20,7 @@ class SinusoidalPosEmb(nn.Module):
 
 
 # -----------------------------
-# Relative positional bias (Swin-style)
-# -----------------------------
-class RelativePositionBias(nn.Module):
-    def __init__(self, window_size, num_heads):
-        super().__init__()
-        self.window_size = window_size
-        self.num_heads = num_heads
-        
-        # Relative position table: (2*window_size-1) × (2*window_size-1)
-        # For window_size=8: 15×15 = 225 possible relative positions
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
-        )
-        
-        # Pre-compute relative position indices
-        coords_h = torch.arange(window_size)
-        coords_w = torch.arange(window_size)
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # [2, ws, ws]
-        coords_flatten = torch.flatten(coords, 1)  # [2, ws*ws]
-        
-        # Relative coordinates: [2, ws*ws, ws*ws]
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # [ws*ws, ws*ws, 2]
-        
-        # Shift to start from 0
-        relative_coords[:, :, 0] += window_size - 1
-        relative_coords[:, :, 1] += window_size - 1
-        relative_coords[:, :, 0] *= 2 * window_size - 1
-        
-        relative_position_index = relative_coords.sum(-1)  # [ws*ws, ws*ws]
-        self.register_buffer("relative_position_index", relative_position_index)
-        
-        # Initialize bias with small values
-        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
-    
-    def forward(self):
-        # Get bias for this window: [ws*ws, ws*ws, num_heads]
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(
-            self.window_size * self.window_size,
-            self.window_size * self.window_size,
-            -1
-        )
-        return relative_position_bias.permute(2, 0, 1).contiguous()  # [num_heads, ws*ws, ws*ws]
-
-
-# -----------------------------
-# Windowed multi-head attention with relative position bias
+# Windowed multi-head attention with optional shifting (Swin style)
 # -----------------------------
 class WindowedAttention(nn.Module):
     def __init__(self, dim, num_heads=8, window_size=8, shift_size=0):
@@ -83,9 +34,6 @@ class WindowedAttention(nn.Module):
         
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
-        
-        # Relative position bias
-        self.relative_position_bias = RelativePositionBias(window_size, num_heads)
     
     def forward(self, x, h, w):
         B, N, C = x.shape
@@ -120,13 +68,8 @@ class WindowedAttention(nn.Module):
         v = rearrange('b (nh ws1) (nw ws2) heads dh -> b (nh nw) heads (ws1 ws2) dh', 
                      v, ws1=ws, ws2=ws)
         
-        # Attention within windows with relative position bias
+        # Attention within windows
         attn = dot('b w h n d, b w h m d -> b w h n m', q, k) * self.scale
-        
-        # Add relative position bias: [num_heads, ws*ws, ws*ws]
-        rel_pos_bias = self.relative_position_bias()  # [nh, ws*ws, ws*ws]
-        attn = attn + rel_pos_bias[None, None, :, :, :]  # Broadcast to [B, num_windows, nh, ws*ws, ws*ws]
-        
         attn = F.softmax(attn, dim=-1)
         
         out = dot('b w h n m, b w h m d -> b w h n d', attn, v)
@@ -166,7 +109,7 @@ class TransformerBlock(nn.Module):
 
 
 # -----------------------------
-# Multi-scale shared transformer with hybrid positional encoding
+# Multi-scale shared transformer diffusion model
 # -----------------------------
 class MultiScaleSharedViT(nn.Module):
     def __init__(self, dim=512, depth=6, num_heads=8, patch_size=4):
@@ -186,14 +129,14 @@ class MultiScaleSharedViT(nn.Module):
         self.scale_embed_64 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.scale_embed_128 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.scale_embed_256 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        
-        # Absolute positional embeddings ONLY at coarse scales for global layout
-        # Finer scales rely on: (1) relative position bias, (2) cascade from coarse scales
-        self.abs_pos_embed_32 = nn.Parameter(torch.randn(1, 64, dim) * 0.02)    # 8×8 tokens - ESSENTIAL
-        self.abs_pos_embed_64 = nn.Parameter(torch.randn(1, 256, dim) * 0.02)   # 16×16 tokens - helpful
-        # No absolute position for 128×128 and 256×256 - they refine coarse structure
-        
-        # Shared transformer blocks with relative position bias
+
+        # Learned position for each possible token position
+        self.pos_embed_32 = nn.Parameter(torch.randn(1, 64, dim) * 0.02)   # 8×8
+        self.pos_embed_64 = nn.Parameter(torch.randn(1, 256, dim) * 0.02)  # 16×16
+        self.pos_embed_128 = nn.Parameter(torch.randn(1, 1024, dim) * 0.02) # 32×32
+        self.pos_embed_256 = nn.Parameter(torch.randn(1, 4096, dim) * 0.02) # 64×64
+
+        # Shared transformer blocks (alternating regular/shifted windows)
         self.blocks = nn.ModuleList([
             TransformerBlock(
                 dim, 
@@ -205,12 +148,11 @@ class MultiScaleSharedViT(nn.Module):
         ])
         
         # Resolution-specific input/output projections
-        # First stage gets 3 channels (RGB), subsequent stages get 6 (noisy input + coarse prediction)
         self.patch_in = nn.ModuleDict({
             '32': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
-            '64': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
-            '128': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
-            '256': nn.Conv2d(6, dim, kernel_size=patch_size, stride=patch_size),
+            '64': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+            '128': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
+            '256': nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size),
         })
         
         self.norm = nn.LayerNorm(dim)
@@ -222,19 +164,18 @@ class MultiScaleSharedViT(nn.Module):
             '256': nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size),
         })
         
-        # Map for embeddings
+        # Map for scale embeddings
         self.scale_embeds = {
             32: self.scale_embed_32,
             64: self.scale_embed_64,
             128: self.scale_embed_128,
             256: self.scale_embed_256,
         }
-        
-        self.abs_pos_embeds = {
-            32: self.abs_pos_embed_32,
-            64: self.abs_pos_embed_64,
-            128: None,  # No absolute position - relies on cascade
-            256: None,  # No absolute position - pure detail refinement
+        self.pos_embeds = {
+            32: self.pos_embed_32,
+            64: self.pos_embed_64,
+            128: self.pos_embed_128,
+            256: self.pos_embed_256,
         }
     
     def forward_single_scale(self, x, t, resolution):
@@ -250,17 +191,11 @@ class MultiScaleSharedViT(nn.Module):
         h, w = tokens.shape[2], tokens.shape[3]
         tokens = rearrange('b c h w -> b (h w) c', tokens)
         
-        # Add embeddings:
-        # 1. Time embedding (what timestep are we at?)
-        # 2. Scale embedding (what resolution level are we at?)
-        # 3. Absolute position embedding (where in the image?) - only at coarse scales
-        abs_pos = self.abs_pos_embeds[resolution]
-        if abs_pos is not None:
-            tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution] + abs_pos
-        else:
-            tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution]
-        
-        # Shared transformer blocks (with relative position bias inside)
+        # Add time and scale embeddings
+        #tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution]
+        tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution] + self.pos_embeds[resolution]
+
+        # Shared transformer blocks
         for block in self.blocks:
             tokens = block(tokens, h, w)
         
@@ -275,51 +210,36 @@ class MultiScaleSharedViT(nn.Module):
         """Cascaded multi-scale processing: 32 → 64 → 128 → 256"""
         target_size = x.shape[-1]
         
-        # Stage 1: Generate base at 32x32 (3 channels: noisy input)
+        # Stage 1: Generate base at 32x32
         x_32 = F.interpolate(x, size=(32, 32), mode='bilinear', align_corners=False)
         out_32 = self.forward_single_scale(x_32, t, resolution=32)
         
         if target_size == 32:
             return out_32
         
-        # Stage 2: Refine at 64x64 (6 channels: noisy input + coarse prediction)
+        # Stage 2: Refine at 64x64
         x_64 = F.interpolate(x, size=(64, 64), mode='bilinear', align_corners=False)
         out_32_up = F.interpolate(out_32, size=(64, 64), mode='bilinear', align_corners=False)
-        out_64 = self.forward_single_scale(torch.cat([x_64, out_32_up], dim=1), t, resolution=64)
+        out_64 = self.forward_single_scale(x_64 + out_32_up, t, resolution=64)
         
         if target_size == 64:
             return out_64
         
-        # Stage 3: Add details at 128x128 (6 channels: noisy input + coarse prediction)
+        # Stage 3: Add details at 128x128
         x_128 = F.interpolate(x, size=(128, 128), mode='bilinear', align_corners=False)
         out_64_up = F.interpolate(out_64, size=(128, 128), mode='bilinear', align_corners=False)
-        out_128 = self.forward_single_scale(torch.cat([x_128, out_64_up], dim=1), t, resolution=128)
+        out_128 = self.forward_single_scale(x_128 + out_64_up, t, resolution=128)
         
         if target_size == 128:
             return out_128
         
-        # Stage 4: Final details at 256x256 (6 channels: noisy input + coarse prediction)
+        # Stage 4: Final details at 256x256
         x_256 = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
         out_128_up = F.interpolate(out_128, size=(256, 256), mode='bilinear', align_corners=False)
-        out_256 = self.forward_single_scale(torch.cat([x_256, out_128_up], dim=1), t, resolution=256)
+        out_256 = self.forward_single_scale(x_256 + out_128_up, t, resolution=256)
         
         return out_256
 
 
-# -----------------------------
-# Convenience wrapper
-# -----------------------------
-class UNet128(nn.Module):
-    """Drop-in replacement for training code that expects UNet128"""
-    def __init__(self, in_channels=3, base_ch=64, emb_dim=128):
-        super().__init__()
-        # Map base_ch to embedding dim: base_ch=64 -> dim=512
-        dim = base_ch * 8
-        self.model = MultiScaleSharedViT(dim=dim, depth=6, num_heads=8)
-    
-    def forward(self, x, t):
-        if t.dim() == 1:
-            t = t.float()
-        else:
             t = t.squeeze(-1).float()
         return self.model(x, t)
