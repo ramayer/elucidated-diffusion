@@ -1,4 +1,4 @@
-# v3
+# v5
 
 import torch
 import torch.nn as nn
@@ -233,8 +233,8 @@ class MultiScaleSharedViT(nn.Module):
         self.abs_pos_embeds = {
             32: self.abs_pos_embed_32,
             64: self.abs_pos_embed_64,
-            128: self.abs_pos_embed_128,
-            256: self.abs_pos_embed_256,
+            128: None,  # No absolute position - relies on cascade
+            256: None,  # No absolute position - pure detail refinement
         }
     
     def forward_single_scale(self, x, t, resolution):
@@ -253,8 +253,12 @@ class MultiScaleSharedViT(nn.Module):
         # Add embeddings:
         # 1. Time embedding (what timestep are we at?)
         # 2. Scale embedding (what resolution level are we at?)
-        # 3. Absolute position embedding (where in the image is this token?)
-        tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution] + self.abs_pos_embeds[resolution]
+        # 3. Absolute position embedding (where in the image?) - only at coarse scales
+        abs_pos = self.abs_pos_embeds[resolution]
+        if abs_pos is not None:
+            tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution] + abs_pos
+        else:
+            tokens = tokens + t_emb[:, None, :] + self.scale_embeds[resolution]
         
         # Shared transformer blocks (with relative position bias inside)
         for block in self.blocks:
