@@ -1,4 +1,4 @@
-#v2
+# v3
 
 import torch
 import torch.nn as nn
@@ -188,12 +188,11 @@ class MultiScaleSharedViT(nn.Module):
         self.scale_embed_128 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.scale_embed_256 = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         
-        # Absolute positional embeddings for global layout understanding
-        # Only at coarse scales where global structure matters
-        self.abs_pos_embed_32 = nn.Parameter(torch.randn(1, 64, dim) * 0.02)    # 8×8 tokens
-        self.abs_pos_embed_64 = nn.Parameter(torch.randn(1, 256, dim) * 0.02)   # 16×16 tokens
-        self.abs_pos_embed_128 = nn.Parameter(torch.randn(1, 1024, dim) * 0.02) # 32×32 tokens
-        self.abs_pos_embed_256 = nn.Parameter(torch.randn(1, 4096, dim) * 0.02) # 64×64 tokens
+        # Absolute positional embeddings ONLY at coarse scales for global layout
+        # Finer scales rely on: (1) relative position bias, (2) cascade from coarse scales
+        self.abs_pos_embed_32 = nn.Parameter(torch.randn(1, 64, dim) * 0.02)    # 8×8 tokens - ESSENTIAL
+        self.abs_pos_embed_64 = nn.Parameter(torch.randn(1, 256, dim) * 0.02)   # 16×16 tokens - helpful
+        # No absolute position for 128×128 and 256×256 - they refine coarse structure
         
         # Shared transformer blocks with relative position bias
         self.blocks = nn.ModuleList([
