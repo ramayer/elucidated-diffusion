@@ -208,7 +208,16 @@ class FineModel(nn.Module):
         self.target_size = target_size
         
         self.patch_in = nn.Conv2d(3, dim, kernel_size=patch_size, stride=patch_size)
-        self.context_proj = nn.Linear(384, dim)
+        self.context_proj = nn.Linear(512, dim)
+        
+        tokens_per_side = target_size // patch_size
+        num_tokens = tokens_per_side ** 2
+        coarse_tokens_per_side = 64 // patch_size
+        scale_factor = tokens_per_side // coarse_tokens_per_side
+        
+        self.rel_pos_embed = nn.Parameter(
+            torch.randn(1, scale_factor * scale_factor, dim) * 0.02
+        )
         
         self.blocks = nn.ModuleList([
             FineBlock(dim, num_heads, window_size=8, 
@@ -216,7 +225,18 @@ class FineModel(nn.Module):
             for i in range(depth)
         ])
         
-        self.patch_out = nn.Linear(dim, 3 * patch_size * patch_size)
+        self.semantic_blend = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.SiLU()
+        )
+        
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim // 2, kernel_size=patch_size, stride=patch_size),
+            nn.GroupNorm(8, dim // 2),
+            nn.SiLU(),
+            nn.Conv2d(dim // 2, 3, 1)
+        )
     
     def forward(self, x, t_emb, coarse_tokens):
         B, C, H, W = x.shape
@@ -226,18 +246,22 @@ class FineModel(nn.Module):
         
         coarse_h = coarse_w = 64 // self.patch_size
         coarse_spatial = rearrange('b (h w) c -> b c h w', coarse_tokens, h=coarse_h, w=coarse_w)
-        coarse_upsampled = F.interpolate(coarse_spatial, size=(h, w), mode='nearest')
+        coarse_upsampled = F.interpolate(coarse_spatial, size=(h, w), mode='bilinear', align_corners=False)
         coarse_upsampled = rearrange('b c h w -> b (h w) c', coarse_upsampled)
         coarse_upsampled = self.context_proj(coarse_upsampled)
         
-        tokens = tokens + coarse_upsampled
+        scale_factor = h // coarse_h
+        rel_pos = self.rel_pos_embed.repeat(B, (h // scale_factor) * (w // scale_factor), 1)
+        
+        tokens = tokens + coarse_upsampled + rel_pos
         
         for block in self.blocks:
             tokens = block(tokens, h, w, t_emb)
         
-        pixels = self.patch_out(tokens)
-        pixels = rearrange('b (h w) (c ph pw) -> b c (h ph) (w pw)', 
-                          pixels, h=h, w=w, c=3, ph=self.patch_size, pw=self.patch_size)
+        tokens_spatial = rearrange('b (h w) c -> b c h w', tokens, h=h, w=w)
+        tokens_spatial = tokens_spatial + self.semantic_blend(tokens_spatial)
+        
+        pixels = self.decoder(tokens_spatial)
         
         return pixels
 
