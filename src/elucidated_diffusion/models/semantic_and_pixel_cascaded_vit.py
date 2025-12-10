@@ -167,7 +167,13 @@ class PatchDiffusion(nn.Module):
         ])
         
         self.norm = nn.LayerNorm(dim)
-        self.unpatch = nn.ConvTranspose2d(dim, 3, kernel_size=patch_size, stride=patch_size)
+        self.unpatch = nn.Sequential(
+            nn.Upsample(scale_factor=patch_size, mode='nearest'),
+            nn.Conv2d(dim, dim // 2, 3, padding=1),
+            nn.GroupNorm(8, dim // 2),
+            nn.SiLU(),
+            nn.Conv2d(dim // 2, 3, 3, padding=1)
+        )
     
     def forward(self, x_pixels, t, semantic_context=None):
         B = x_pixels.shape[0]
