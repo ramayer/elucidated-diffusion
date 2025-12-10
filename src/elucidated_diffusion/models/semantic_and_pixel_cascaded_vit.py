@@ -16,7 +16,7 @@ class SinusoidalPosEmb(nn.Module):
         return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
 
 class WindowedAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0):
+    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0, use_rel_pos=False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -25,9 +25,25 @@ class WindowedAttention(nn.Module):
         self.shift_size = shift_size
         self.scale = self.head_dim ** -0.5
         self.use_windowed = window_size > 0
+        self.use_rel_pos = use_rel_pos
         
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
+        
+        if use_rel_pos and self.use_windowed:
+            self.rel_pos_bias = nn.Parameter(
+                torch.zeros((2 * window_size - 1) * (2 * window_size - 1), num_heads)
+            )
+            coords_h = torch.arange(window_size)
+            coords_w = torch.arange(window_size)
+            coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
+            coords_flatten = coords.flatten(1)
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+            relative_coords[:, :, 0] += window_size - 1
+            relative_coords[:, :, 1] += window_size - 1
+            relative_coords[:, :, 0] *= 2 * window_size - 1
+            self.register_buffer("relative_position_index", relative_coords.sum(-1))
     
     def forward(self, x, h, w):
         B, N, C = x.shape
@@ -73,6 +89,13 @@ class WindowedAttention(nn.Module):
                      v, ws1=ws, ws2=ws)
         
         attn = dot('b w h n d, b w h m d -> b w h n m', q, k) * self.scale
+        
+        if self.use_rel_pos:
+            rel_pos_bias = self.rel_pos_bias[self.relative_position_index.view(-1)].view(
+                ws * ws, ws * ws, -1)
+            rel_pos_bias = rel_pos_bias.permute(2, 0, 1).contiguous()
+            attn = attn + rel_pos_bias.unsqueeze(0).unsqueeze(0)
+        
         attn = F.softmax(attn, dim=-1)
         
         out = dot('b w h n m, b w h m d -> b w h n d', attn, v)
@@ -88,10 +111,10 @@ class WindowedAttention(nn.Module):
         return self.proj(out_flat)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0, mlp_ratio=4):
+    def __init__(self, dim, num_heads=8, window_size=8, shift_size=0, mlp_ratio=4, use_rel_pos=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowedAttention(dim, num_heads, window_size, shift_size)
+        self.attn = WindowedAttention(dim, num_heads, window_size, shift_size, use_rel_pos)
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * mlp_ratio),
@@ -126,12 +149,19 @@ class PatchDiffusion(nn.Module):
         window_size = min(8, tokens_per_side)
         use_windowed = tokens_per_side > 8
         
+        if not use_windowed:
+            num_tokens = tokens_per_side ** 2
+            self.pos_embed = nn.Parameter(torch.randn(1, num_tokens, dim) * 0.02)
+        else:
+            self.pos_embed = None
+        
         self.blocks = nn.ModuleList([
             TransformerBlock(
                 dim, num_heads,
                 window_size=window_size if use_windowed else 0,
                 shift_size=0 if not use_windowed or i % 2 == 0 else window_size // 2,
-                mlp_ratio=4
+                mlp_ratio=4,
+                use_rel_pos=use_windowed
             )
             for i in range(depth)
         ])
@@ -158,6 +188,9 @@ class PatchDiffusion(nn.Module):
             tokens = self.semantic_proj(tokens)
         
         tokens = tokens + t_emb[:, None, :]
+        
+        if self.pos_embed is not None:
+            tokens = tokens + self.pos_embed
         
         for block in self.blocks:
             tokens = block(tokens, h, w)
