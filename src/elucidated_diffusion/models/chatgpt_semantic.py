@@ -2,6 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# from https://chatgpt.com/c/6939a2b4-a380-8331-a461-9f760607922b
+# It's the model after the comment
+#    “please give me the fully fixed code including buffer registration and input projection”
+# run with
+#    model = MultiScaleViT_EDM(dim=256, heads=8, blocks_per_scale=4)
+#
+# It generates very nice textures appropriate to the source material; but
+# does not do well on global consistency or composition across distant
+# parts of an image.
+
 
 # ------------------------------------------------------------
 # Sinusoidal time embedding (classic diffusion style)

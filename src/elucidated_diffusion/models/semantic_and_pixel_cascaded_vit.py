@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einx import rearrange, dot
 
+# Slow to train - feels like it's headed an OK direction, but 
+# otehr models seem to converge much faster?
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -167,6 +170,13 @@ class PatchDiffusion(nn.Module):
         ])
         
         self.norm = nn.LayerNorm(dim)
+        
+        self.token_blend = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.SiLU()
+        )
+        
         self.unpatch = nn.Sequential(
             nn.Upsample(scale_factor=patch_size, mode='nearest'),
             nn.Conv2d(dim, dim // 2, 3, padding=1),
@@ -204,6 +214,8 @@ class PatchDiffusion(nn.Module):
         tokens = self.norm(tokens)
         
         tokens_spatial = rearrange('b (h w) c -> b c h w', tokens, h=h, w=w)
+        tokens_spatial = tokens_spatial + self.token_blend(tokens_spatial)
+        
         pixels = self.unpatch(tokens_spatial)
         
         return pixels, tokens
