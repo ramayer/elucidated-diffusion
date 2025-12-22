@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einx import rearrange, dot
 
+# Largely from
+# https://claude.ai/share/c5ca31ad-89b0-4a15-a8ee-ae2903859270
+# https://claude.ai/public/artifacts/b5cc9d34-874e-4ba8-af22-72342cc9751a
+
 # -----------------------------
 # Positional embedding for timestep
 # -----------------------------
@@ -158,6 +162,10 @@ class SkipAttentionUNet(nn.Module):
             nn.Linear(emb_dim, emb_dim),
             nn.ReLU()
         )
+
+        # On 128x128 pokemon, the defaults are great.
+        self.base_ch = base_ch
+        self.emb_dim = emb_dim
 
         # Encoder
         self.inc = ResBlock(in_channels, base_ch, emb_dim)
