@@ -90,7 +90,7 @@ class ResBlock(nn.Module):
 # -----------------------------
 # 64x64 RGB U-Net (channel-corrected)
 # -----------------------------
-class UNet128(nn.Module):
+class ChatGPTDiffusionUNet128(nn.Module):
     def __init__(self, in_channels=3, base_ch=64, emb_dim=128, use_attention=True):
         super().__init__()
         self.time_mlp = nn.Sequential(
