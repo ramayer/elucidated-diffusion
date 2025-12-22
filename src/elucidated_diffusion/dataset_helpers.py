@@ -43,8 +43,8 @@ class SimpleAugmentConfig:
     hflip: bool = True
 
     # Crop bias (pixels)
-    max_top_crop: int = 8
-    max_bottom_crop: int = 128
+    max_top_crop: int = 4
+    max_bottom_crop: int = 24
 
     # Color jitter
     color_jitter: bool = True
