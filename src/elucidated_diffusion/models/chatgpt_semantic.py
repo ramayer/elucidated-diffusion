@@ -129,7 +129,7 @@ class TransformerBlock(nn.Module):
 # Multi-Scale ViT Backbone (32 → 64 → 128)
 # ------------------------------------------------------------
 
-class MultiScaleViT(nn.Module):
+class ChatGPTMultiScaleViT(nn.Module):
     def __init__(self,
                  dim=256,
                  heads=8,
@@ -255,14 +255,3 @@ class MultiScaleViT(nn.Module):
         return self.out_proj(x128)
 
 
-# ------------------------------------------------------------
-# Wrapper that returns only predicted denoised image
-# ------------------------------------------------------------
-
-class MultiScaleViT_EDM(nn.Module):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.model = MultiScaleViT(**kwargs)
-
-    def forward(self, x, t):
-        return self.model(x, t)  # only return image
