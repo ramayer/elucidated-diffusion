@@ -1,9 +1,43 @@
 # https://claude.ai/share/fb8d088e-9d82-4715-b7c1-44bd727e0278
 # TODO - try this again - it showed some promise but was noisy.
+#
+# ChatGPT said it could help:
+# https://chatgpt.com/share/693f7803-7948-800b-8fd3-26c31adc9e1e
+#
+# This might be the most promising pure-ViT models so far.
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einx import rearrange, dot
+import math
+
+def get_2d_sincos_pos_embed(dim, h, w, device):
+    assert dim % 4 == 0, "dim must be divisible by 4 for 2D sin/cos"
+
+    y, x = torch.meshgrid(
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing="ij"
+    )
+
+    y = y.flatten().float()
+    x = x.flatten().float()
+
+    omega = torch.arange(dim // 4, device=device).float()
+    omega = 1.0 / (10000 ** (omega / (dim // 4)))
+
+    out_x = torch.einsum('n,d->nd', x, omega)
+    out_y = torch.einsum('n,d->nd', y, omega)
+
+    pos = torch.cat(
+        [torch.sin(out_x), torch.cos(out_x),
+         torch.sin(out_y), torch.cos(out_y)],
+        dim=1
+    )
+
+    return pos  # shape: (h*w, dim)
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -172,8 +206,16 @@ class PatchDiffusion(nn.Module):
         self.norm = RMSNorm(dim)
         
         self.unpatch = nn.Sequential(
-            nn.Upsample(scale_factor=patch_size, mode='nearest'),
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+
+            ## Claude liked these lines
+            # nn.Upsample(scale_factor=patch_size, mode='nearest'),
+            # nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
+            
+            ## ChatGPT liked these lines
+            # Training is drastically different
+            nn.ConvTranspose2d(dim, dim, kernel_size=patch_size, stride=patch_size),
+            nn.Conv2d(dim, dim, 3, padding=1, groups=1),
+
             nn.Conv2d(dim, dim // 2, 1),
             nn.GroupNorm(8, dim // 2),
             nn.SiLU(),
@@ -185,39 +227,92 @@ class PatchDiffusion(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-    
+
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(64, 3, 3, padding=1),
+        )
+
+        # Global semantic token
+        self.global_token_proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.global_token_proj.weight)
+        nn.init.zeros_(self.global_token_proj.bias)
+
+
     def forward(self, x_pixels, t, semantic_context=None):
+        """
+        x_pixels: (B, 3, H, W)
+        t:        (B,)
+        semantic_context: (B, 1, C) or None
+        """
+
         B = x_pixels.shape[0]
-        
-        t_emb = self.time_embed(t)
-        
-        tokens = self.patch_embed(x_pixels)
+
+        # --- time embedding ---
+        t_emb = self.time_embed(t)  # (B, C)
+
+        # --- patch embedding ---
+        tokens = self.patch_embed(x_pixels)          # (B, C, h, w)
         h, w = tokens.shape[2], tokens.shape[3]
-        tokens = rearrange('b c h w -> b (h w) c', tokens)
-        
-        if semantic_context is not None:
-            sem_h = sem_w = int(semantic_context.shape[1] ** 0.5)
-            semantic_spatial = rearrange('b (h w) c -> b c h w', semantic_context, h=sem_h, w=sem_w)
-            semantic_up = F.interpolate(semantic_spatial, size=(h, w), mode='bilinear', align_corners=False)
-            semantic_up = rearrange('b c h w -> b (h w) c', semantic_up)
-            
-            tokens = torch.cat([tokens, semantic_up], dim=-1)
-            tokens = self.semantic_proj(tokens)
-        
+        tokens = rearrange('b c h w -> b (h w) c', tokens)  # (B, N, C)
+
+        # --- positional embedding (sin/cos) ---
+        pos = get_2d_sincos_pos_embed(
+            self.dim, h, w, tokens.device
+        )                                              # (N, C)
+        tokens = tokens + pos[None, :, :]
+
+        # --- time conditioning ---
         tokens = tokens + t_emb[:, None, :]
-        
-        if self.pos_embed is not None:
-            tokens = tokens + self.pos_embed
-        
+
+        # =========================================================
+        # GLOBAL SEMANTIC TOKEN
+        # =========================================================
+
+        if semantic_context is None:
+            # Initialize from current image tokens
+            global_token = tokens.mean(dim=1, keepdim=True)  # (B, 1, C)
+        else:
+            # Passed from lower-resolution model
+            global_token = semantic_context                  # (B, 1, C)
+
+        # Optional learned projection (zero-init, stable)
+        global_token = global_token + self.global_token_proj(global_token)
+
+        # Inject global semantics into every token
+        tokens = tokens + global_token
+
+        # =========================================================
+        # TRANSFORMER BLOCKS
+        # =========================================================
+
         for block in self.blocks:
             tokens = block(tokens, h, w)
-        
+
+        # --- final norm ---
         tokens = self.norm(tokens)
-        
-        tokens_spatial = rearrange('b (h w) c -> b c h w', tokens, h=h, w=w)
+
+        # --- update global token AFTER blocks ---
+        # (this is what we pass upward)
+        global_token = tokens.mean(dim=1, keepdim=True)  # (B, 1, C)
+
+        # =========================================================
+        # UNPATCH TO PIXELS
+        # =========================================================
+
+        tokens_spatial = rearrange(
+            'b (h w) c -> b c h w', tokens, h=h, w=w
+        )
         pixels = self.unpatch(tokens_spatial)
-        
-        return pixels, tokens
+        pixels = pixels + 0.1 * self.refine(pixels)
+        # IMPORTANT:
+        # We return ONLY the global token as semantic_context
+        return pixels, global_token
+
 
 class ResearchBackedHybridViT(nn.Module):
     def __init__(self, dim=384, depth=6, num_heads=8, patch_size=4, resid_scale=0.5):

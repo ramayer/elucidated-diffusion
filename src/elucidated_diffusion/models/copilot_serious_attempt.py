@@ -85,7 +85,7 @@ class AttentionBlock(nn.Module):
         return x + self.proj(out)
 
 # --- Full unrolled U-Net ---
-class UNet128_Unrolled(nn.Module):
+class UNet128_WithStructureMap(nn.Module):
     def __init__(self, in_channels=3, base_ch=128, time_dim=256):
         super().__init__()
         self.time_mlp = TimeMLP(emb_dim=time_dim, model_dim=time_dim)
@@ -119,6 +119,17 @@ class UNet128_Unrolled(nn.Module):
         ])
         self.downsample4 = nn.Conv2d(512, 512, 3, stride=2, padding=1)  # → 8x8
 
+        # --- Structure map head ---
+        self.struct_head = nn.Sequential(
+            nn.GroupNorm(32, 512),
+            nn.SiLU(),
+            nn.Conv2d(512, 32, 1)
+        )
+        # Predicts a 5-channel structure map at 16×16:
+        # [0] head, [1] eyes, [2] nose, [3] mouth, [4] body/core
+        # These are soft spatial maps (not hard labels)
+        # Changed from 5 to 32 
+
         # --- Mid ---
         self.mid = nn.ModuleList([
             ResBlock(512, 512, time_dim),
@@ -129,7 +140,7 @@ class UNet128_Unrolled(nn.Module):
         # --- Up path ---
         self.upsample4 = nn.ConvTranspose2d(512, 512, 4, stride=2, padding=1)  # 8x8 → 16x16
         self.up4 = nn.ModuleList([
-            ResBlock(512 + 512, 512, time_dim),
+            ResBlock(512 + 512 + 32, 512, time_dim),  # concat x4 + struct_map
             AttentionBlock(512),
             ResBlock(512, 512, time_dim),
         ])
@@ -164,45 +175,49 @@ class UNet128_Unrolled(nn.Module):
         h = x0
         for block in self.down1:
             h = block(h, t_emb)
-        x1 = h  # 128x128, 128
+        x1 = h
 
         h = self.downsample1(x1)  # 64x64, 256
         for block in self.down2:
             h = block(h, t_emb)
-        x2 = h  # 64x64, 256
+        x2 = h
 
         h = self.downsample2(x2)  # 32x32, 384
         for block in self.down3:
             h = block(h, t_emb) if isinstance(block, ResBlock) else block(h)
-        x3 = h  # 32x32, 384
+        x3 = h
 
         h = self.downsample3(x3)  # 16x16, 512
         for block in self.down4:
             h = block(h, t_emb) if isinstance(block, ResBlock) else block(h)
-        x4 = h  # 16x16, 512
+        x4 = h  # 16×16, 512
 
-        h = self.downsample4(x4)  # 8x8, 512
+        # Predict structure map from x4
+        struct_map = self.struct_head(x4)  # 16×16, 5 (now 32)
+        # This is a soft spatial map indicating where key parts (head, eyes, etc.) are likely to be
+
+        h = self.downsample4(x4)
         for block in self.mid:
             h = block(h, t_emb) if isinstance(block, ResBlock) else block(h)
-        x5 = h  # 8x8, 512
+        x5 = h  # 8×8, 512
 
         # Up path
-        h = self.upsample4(x5)  # 16x16, 512
-        h = torch.cat([h, x4], dim=1)
+        h = self.upsample4(x5)  # 16×16, 512
+        h = torch.cat([h, x4, struct_map], dim=1)  # 512 + 512 + 5 (now 32) = 1029
         for block in self.up4:
             h = block(h, t_emb) if isinstance(block, ResBlock) else block(h)
 
-        h = self.upsample3(h)  # 32x32, 384
+        h = self.upsample3(h)  # 32×32, 384
         h = torch.cat([h, x3], dim=1)
         for block in self.up3:
             h = block(h, t_emb) if isinstance(block, ResBlock) else block(h)
 
-        h = self.upsample2(h)  # 64x64, 256
+        h = self.upsample2(h)  # 64×64, 256
         h = torch.cat([h, x2], dim=1)
         for block in self.up2:
             h = block(h, t_emb)
 
-        h = self.upsample1(h)  # 128x128, 128
+        h = self.upsample1(h)  # 128×128, 128
         h = torch.cat([h, x1], dim=1)
         for block in self.up1:
             h = block(h, t_emb)
@@ -210,3 +225,4 @@ class UNet128_Unrolled(nn.Module):
         h = self.out_norm(h)
         h = F.silu(h)
         return self.out_conv(h)
+

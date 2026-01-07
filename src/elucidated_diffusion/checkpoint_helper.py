@@ -11,14 +11,13 @@ NOTE - ITS IMPORTANT this works in multiple situations.
 
 """
 
-def save_checkpoint(model, optimizer, epoch, loss, path=None, tag = ""):
+def save_checkpoint(path, model, optimizer, metadata = {}):
     checkpoint = {
-        "epoch": epoch,
-        "loss": loss,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
         "model_class": model.__class__.__name__,
         "model_repr": str(model),  # optional: full repr for reference
+        "metadata": metadata,
     }
 
     if path is None:
@@ -40,9 +39,8 @@ def load_checkpoint(model, optimizer, path, map_location=None, strict=True):
     if optimizer:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     print(f"🔄 Loaded checkpoint from {path}")
-    print(f"    Epoch: {checkpoint.get('epoch', '?')}, Loss: {checkpoint.get('loss', '?')}")
     print(f"    Model class: {checkpoint.get('model_class', '?')}")
-    return model, optimizer, checkpoint
+    return model, optimizer, checkpoint.get('metadata',{})
 
 def show_model_info(model_edm):
     # Totals

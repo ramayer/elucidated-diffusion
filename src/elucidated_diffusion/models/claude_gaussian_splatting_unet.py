@@ -184,16 +184,8 @@ class GaussianSplattingDiffusionUNet(nn.Module):
             nn.ReLU()
         )
         
-        # Learnable denoising schedule - predicts how much to trust Gaussians vs keep noise
-        self.denoise_schedule = nn.Sequential(
-            nn.Linear(emb_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # Output in [0, 1]: 0=keep all noise, 1=fully trust Gaussians
-        )
-        
         self.residual_refine = nn.Sequential(
-            # Input: 3 (rendered) + base_ch (x1 skip)
+            # Input: 3 (rendered Gaussians) + base_ch (x1 skip)
             nn.Conv2d(in_channels + base_ch, base_ch, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(base_ch, base_ch // 2, 3, padding=1),
@@ -235,18 +227,9 @@ class GaussianSplattingDiffusionUNet(nn.Module):
         # Render Gaussians (coarse structure)
         rendered_gaussians = self.renderer(gaussian_params)
         
-        # Learn how much to denoise based on time
-        # High t (noisy) → low denoise_strength (keep more noise)
-        # Low t (clean) → high denoise_strength (trust Gaussians more)
-        denoise_strength = self.denoise_schedule(t_emb)  # [B, 1]
-        denoise_strength = denoise_strength.view(B, 1, 1, 1)
-        
-        # Blend noisy input with Gaussian rendering
-        # This preserves high-frequency noise structure while adding Gaussian content
-        denoised_base = x * (1 - denoise_strength) + rendered_gaussians * denoise_strength
-        
-        # Residual refinement sees: blended result + early skip features
-        residual_input = torch.cat([denoised_base, x1], dim=1)
+        # Residual refinement adds details to Gaussian rendering
+        # Input: rendered Gaussians + early skip features
+        residual_input = torch.cat([rendered_gaussians, x1], dim=1)
         
         # First conv layer, then add time embedding
         residual_features = self.residual_refine[0](residual_input)  # First conv
@@ -262,8 +245,9 @@ class GaussianSplattingDiffusionUNet(nn.Module):
         
         residual_correction = residual_features
         
-        # Apply small residual correction
-        output = denoised_base + 0.2 * residual_correction
+        # Predict clean image: Gaussians provide structure, residual adds details
+        # The EDM preconditioning (c_skip * noisy + c_out * output) happens externally
+        output = rendered_gaussians + 0.3 * residual_correction
         output = torch.clamp(output, -1, 1)
         
         return output
