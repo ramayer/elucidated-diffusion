@@ -31,7 +31,6 @@ def unified_edm_sampling(model, num_steps=18, batch_size=8, img_shape=(3, 256, 2
     Returns:
         Generated images [B, C, H, W]
     """
-    print("in uified_edm_sampleing shape is ",img_shape)
     device = next(model.parameters()).device
     is_super_resolution = lr_conditioning is not None
     
@@ -150,7 +149,6 @@ def edm_super_resolve(model, lr_images, num_steps=18, headstart_sigma=None):
 # Backward compatibility - keep your existing function names
 def edm_ancestral_sampling_for_diffusion(model, num_steps=18, batch_size=8, img_shape=(3, 64, 64)):
     """Backward compatibility wrapper"""
-    print("in edm_ancestral_sampling_for_diffusion shape is ",img_shape)
     return edm_generate_from_noise(model, num_steps, batch_size, img_shape)
 
 def edm_ancestral_sampling_for_sr(model, lr_64, num_steps=18, batch_size=8, img_shape=(3, 256, 256), 
