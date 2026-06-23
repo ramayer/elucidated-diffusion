@@ -270,8 +270,21 @@ def channel_schedule(num_layers, base_ch, max_ch=512, shape="linear"):
         return [min(base_ch, max_ch)]
 
     top_ch = min(base_ch * num_layers, max_ch)
-    t = torch.linspace(0, 1, num_layers)
+    return _interpolate_schedule(num_layers, base_ch, top_ch, shape)
 
+
+def _interpolate_schedule(num_layers, start_ch, end_ch, shape="linear"):
+    """
+    Channel counts smoothly interpolated from start_ch to end_ch over
+    num_layers steps (inclusive of both ends), using the same curve
+    shapes as channel_schedule. Unlike channel_schedule, the endpoints
+    are hit exactly -- useful when a downstream shape (e.g. vit_ch at
+    the ViT/decoder boundary) is a hard constraint rather than a cap.
+    """
+    if num_layers == 1:
+        return [start_ch]
+
+    t = torch.linspace(0, 1, num_layers)
     if shape == "linear":
         curve = t
     elif shape == "front_loaded":
@@ -281,8 +294,8 @@ def channel_schedule(num_layers, base_ch, max_ch=512, shape="linear"):
     else:
         raise ValueError(f"Unknown shape '{shape}', expected linear/front_loaded/back_loaded")
 
-    channels = base_ch + curve * (top_ch - base_ch)
-    return [min(int(round(c.item())), max_ch) for c in channels]
+    channels = start_ch + curve * (end_ch - start_ch)
+    return [int(round(c.item())) for c in channels]
 
 
 # =============================================================================
@@ -347,17 +360,31 @@ class SemanticRefiner(nn.Module):
     features to sharpen the semantic statement -- "the upper half of this
     region is iris, the lower half is eyelid" -- before passing it on to be
     sharpened again at the next, even higher resolution.
+
+    Channel width shrinks from in_sem_ch to out_sem_ch as this happens, the
+    same way the CNN's own channel schedule shrinks with resolution: fewer
+    spatial positions at the bottleneck means each one has to represent more
+    ("a green eye with bushy eyebrows"), while more positions near full
+    resolution each cover less ground and don't need as wide a budget.
+
+    upsample does the resolution AND channel change in one strided/transposed
+    conv. fuse then mixes the (already spatially-positioned) semantic signal
+    with this level's local decoder features -- a 1x1 conv is enough here,
+    since fuse's job is combining channels at a position, not detecting
+    spatial patterns; the semantic map arrives already smooth, and the
+    decoder features arrive already locally processed by ConvBlock's own
+    3x3 convs immediately before this runs.
     """
 
-    def __init__(self, semantic_ch, decoder_ch, in_res, out_res):
+    def __init__(self, in_sem_ch, out_sem_ch, decoder_ch, in_res, out_res):
         super().__init__()
-        self.upsample = make_resize_layer(semantic_ch, semantic_ch, in_res, out_res)
+        self.upsample = make_resize_layer(in_sem_ch, out_sem_ch, in_res, out_res)
         self.fuse = nn.Sequential(
-            nn.Conv2d(semantic_ch + decoder_ch, semantic_ch, 3, padding=1),
+            nn.Conv2d(out_sem_ch + decoder_ch, out_sem_ch, 1),
             nn.GELU(),
-            nn.Conv2d(semantic_ch, semantic_ch, 3, padding=1),
+            nn.Conv2d(out_sem_ch, out_sem_ch, 1),
         )
-        self.inject = nn.Conv2d(semantic_ch, decoder_ch, 1)
+        self.inject = nn.Conv2d(out_sem_ch, decoder_ch, 1)
 
     def forward(self, decoder_features, semantic_map):
         semantic_map = self.upsample(semantic_map)
@@ -371,7 +398,17 @@ class SemanticRefiner(nn.Module):
 # progressively-refined semantic guidance
 # =============================================================================
 class CNNDecoder(nn.Module):
-    def __init__(self, channels, out_channels, emb_dim, semantic_ch, vit_resolution, in_channels):
+    def __init__(
+        self,
+        channels,
+        out_channels,
+        emb_dim,
+        vit_ch,
+        entry_resolution,
+        in_channels,
+        semantic_min_ch=32,
+        semantic_shape="linear",
+    ):
         super().__init__()
         reversed_channels = list(reversed(channels))
 
@@ -379,13 +416,36 @@ class CNNDecoder(nn.Module):
         self.blocks = nn.ModuleList()
         self.refiners = nn.ModuleList()
 
-        res = vit_resolution
+        # The semantic map shrinks in channel width across the same number
+        # of levels the CNN decoder has, from vit_ch at the bottleneck down
+        # to semantic_min_ch at full resolution. Its shape (linear /
+        # front_loaded / back_loaded) is a free parameter, independent of
+        # the CNN's own channel_shape -- there's no requirement the two
+        # curves match, since a "how compressed is this concept" schedule
+        # and a "how much raw texture capacity is needed here" schedule
+        # are answering different questions. vit_ch must be hit exactly at
+        # the bottleneck (it's a hard constraint, not a cap), so this uses
+        # _interpolate_schedule rather than channel_schedule. num_levels+1
+        # boundary points are generated (entry, then one exit per level) so
+        # every level actually shrinks, rather than wasting the first level
+        # on a vit_ch -> vit_ch no-op.
+        num_levels = len(reversed_channels)
+        sem_boundaries = _interpolate_schedule(num_levels + 1, vit_ch, semantic_min_ch, shape=semantic_shape)
+
+        # entry_resolution is cnn_resolution -- where both the CNN feature
+        # path (post-bottleneck) and the semantic map (after being resized
+        # from vit_resolution if the two differ) start from. Both then
+        # double together at every decoder level up to img_size.
+        res = entry_resolution
         for i, ch in enumerate(reversed_channels):
             in_ch = channels[-1] if i == 0 else reversed_channels[i - 1]
             self.ups.append(nn.ConvTranspose2d(in_ch, ch, kernel_size=2, stride=2))
             self.blocks.append(ConvBlock(ch * 2, ch, emb_dim))
+
+            in_sem_ch = sem_boundaries[i]
+            out_sem_ch = sem_boundaries[i + 1]
             next_res = res * 2
-            self.refiners.append(SemanticRefiner(semantic_ch, ch, res, next_res))
+            self.refiners.append(SemanticRefiner(in_sem_ch, out_sem_ch, ch, res, next_res))
             res = next_res
 
         # With no CNN layers (pure ViT), the decoder loop above never runs,
@@ -438,7 +498,21 @@ class CorticalRefinerUNet(nn.Module):
     channel_shape : str
         'linear', 'front_loaded', or 'back_loaded' -- see channel_schedule().
     vit_ch : int
-        Channel width of the ViT stage.
+        Channel width of the ViT stage. Also the width of the semantic map
+        at the decoder's bottleneck end.
+    semantic_min_ch : int
+        Width of the semantic map by the time it reaches the decoder's
+        final (full-resolution) level. The map shrinks from vit_ch down to
+        this value across the decoder, mirroring how the CNN's own channel
+        budget shrinks as spatial resolution grows -- a coarse position can
+        carry a compound concept ("a green eye with bushy eyebrows"), a
+        fine position only needs to carry a narrower one ("green eye").
+    semantic_shape : str
+        'linear', 'front_loaded', or 'back_loaded' -- the curve the
+        semantic channel shrinkage follows. Independent of channel_shape:
+        there's no requirement that "how compressed a concept needs to be"
+        and "how much raw texture capacity a resolution needs" follow the
+        same curve.
     emb_dim : int
         Dimension of the timestep embedding.
     num_heads : int
@@ -454,6 +528,8 @@ class CorticalRefinerUNet(nn.Module):
         base_ch=64,
         channel_shape="linear",
         vit_ch=256,
+        semantic_min_ch=32,
+        semantic_shape="linear",
         emb_dim=128,
         in_channels=3,
         out_channels=3,
@@ -467,6 +543,13 @@ class CorticalRefinerUNet(nn.Module):
             raise ValueError(
                 f"cnn_resolution ({cnn_resolution}) and vit_resolution ({vit_resolution}) "
                 "must evenly divide one another"
+            )
+        if vit_ch <= 0:
+            raise ValueError(
+                f"vit_ch must be a positive integer, got {vit_ch}. The patchify bridge "
+                "(to_vit/from_vit) always runs, even when vit_layers=0, so there's no "
+                "vit_ch value that disables it -- to get a lean pure-CNN model, use a "
+                "small vit_ch (e.g. 8-16) rather than 0."
             )
 
         self.img_size = img_size
@@ -489,11 +572,27 @@ class CorticalRefinerUNet(nn.Module):
         self.to_vit = make_resize_layer(encoder_out_ch, vit_ch, cnn_resolution, vit_resolution)
         self.from_vit = make_resize_layer(vit_ch, encoder_out_ch, vit_resolution, cnn_resolution)
 
+        # Separate, channel-preserving resize for the semantic map itself
+        # (vit_ch -> vit_ch), so it enters the decoder at cnn_resolution --
+        # the same resolution the CNN decoder path starts from -- rather
+        # than at vit_resolution, which differs whenever vit_resolution is
+        # set independently of cnn_resolution. A no-op (1x1 conv) when the
+        # two resolutions already match. Only needed when there's a CNN
+        # decoder to feed at all -- with cnn_layers=0 the decoder's
+        # refiner chain is empty and never touches the semantic map.
+        self.semantic_to_cnn_res = (
+            make_resize_layer(vit_ch, vit_ch, vit_resolution, cnn_resolution)
+            if cnn_layers > 0 else None
+        )
+
         self.vit_blocks = nn.ModuleList([
             ViTBlock(vit_ch, emb_dim, num_heads=num_heads) for _ in range(vit_layers)
         ])
 
-        self.decoder = CNNDecoder(channels, out_channels, emb_dim, vit_ch, vit_resolution, in_channels)
+        self.decoder = CNNDecoder(
+            channels, out_channels, emb_dim, vit_ch, cnn_resolution, in_channels,
+            semantic_min_ch=semantic_min_ch, semantic_shape=semantic_shape,
+        )
 
     def forward(self, x, t, return_attn=False):
         if t.dim() > 1:
@@ -515,7 +614,15 @@ class CorticalRefinerUNet(nn.Module):
                 attn_maps.append(attn_map)
 
         h = self.from_vit(semantic)
-        out = self.decoder(h, skip_features, semantic, t_emb)
+        # The decoder's progressive refinement chain starts from the same
+        # resolution the CNN decoder path starts from (cnn_resolution), not
+        # vit_resolution -- those differ whenever vit_resolution is set
+        # independently of cnn_resolution. Resize the semantic map (still
+        # at vit_ch channels) up to cnn_resolution so both decoder inputs
+        # start from a consistent resolution. Skipped entirely when there's
+        # no CNN decoder (cnn_layers=0) to feed.
+        semantic_for_decoder = self.semantic_to_cnn_res(semantic) if self.semantic_to_cnn_res is not None else semantic
+        out = self.decoder(h, skip_features, semantic_for_decoder, t_emb)
 
         if return_attn:
             return out, attn_maps
