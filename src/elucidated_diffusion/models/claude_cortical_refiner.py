@@ -14,13 +14,53 @@ except ImportError as e:
 # Time embedding
 # =============================================================================
 class SinusoidalTimeEmbedding(nn.Module):
-    """Standard transformer-style sinusoidal embedding of the diffusion timestep."""
+    """
+    Standard transformer-style sinusoidal embedding of the diffusion timestep.
 
-    def __init__(self, dim):
+    The frequency bank here is tuned for inputs spanning roughly hundreds to
+    thousands of units (e.g. DDPM-style integer timesteps in [0, 1000)).
+    EDM-style noise conditioning (c_noise = sigma.log() / 4) is a continuous
+    value with a much narrower range -- typically std ~0.3, span roughly
+    [-1.6, 0.9] under common EDM hyperparameters (P_mean=-1.2, P_std=1.2).
+    Fed directly into this embedding, that narrow range barely moves most of
+    the frequency channels, so very different noise levels end up mapped to
+    nearly identical embeddings (cosine similarity ~0.96-1.0 in practice) --
+    the network loses most of its ability to tell noise levels apart.
+
+    t_scale rescales the input before the frequency bank is applied, so the
+    *effective* range seen by the embedding lands back in the well-separated
+    regime this embedding was designed for, regardless of the raw input's
+    native scale. Pass scale_for_std() a measurement of your timestep
+    input's std (e.g. c_noise.std() over a batch) to compute a sensible
+    fixed value -- fixed rather than learned, since the right order of
+    magnitude is already computable from your own noise schedule's
+    hyperparameters (P_mean/P_std), and a learned scale would need gradient
+    signal flowing through the very embedding that starts out collapsed,
+    which is a slow, easy-to-get-stuck starting point for exactly the
+    quantity meant to fix that collapse.
+    """
+
+    def __init__(self, dim, t_scale=1.0):
         super().__init__()
         if dim < 4 or dim % 2 != 0:
             raise ValueError(f"emb_dim must be an even number >= 4, got {dim}")
         self.dim = dim
+        self.t_scale = t_scale
+
+    @staticmethod
+    def scale_for_std(input_std, target_std=300.0):
+        """
+        Suggests a t_scale value given the std of your actual timestep input
+        (e.g. c_noise.std() measured over a representative batch). Targets
+        an effective post-scale std of ~300, comfortably in the
+        well-separated regime DDPM-style integer timesteps already occupy.
+
+        Example: under standard EDM defaults (P_mean=-1.2, P_std=1.2),
+        c_noise has std = P_std / 4 = 0.3, so:
+        >>> SinusoidalTimeEmbedding.scale_for_std(0.3)
+        1000.0
+        """
+        return target_std / input_std
 
     def forward(self, t):
         half_dim = self.dim // 2
@@ -28,7 +68,7 @@ class SinusoidalTimeEmbedding(nn.Module):
             torch.arange(half_dim, device=t.device, dtype=torch.float32)
             * -(math.log(10000.0) / (half_dim - 1))
         )
-        args = t[:, None].float() * freqs[None, :]
+        args = (t[:, None].float() * self.t_scale) * freqs[None, :]
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
@@ -408,13 +448,14 @@ class CNNDecoder(nn.Module):
         in_channels,
         semantic_min_ch=32,
         semantic_shape="linear",
+        use_semantic_refinement=True,
     ):
         super().__init__()
         reversed_channels = list(reversed(channels))
 
         self.ups = nn.ModuleList()
         self.blocks = nn.ModuleList()
-        self.refiners = nn.ModuleList()
+        self.refiners = nn.ModuleList() if use_semantic_refinement else None
 
         # The semantic map shrinks in channel width across the same number
         # of levels the CNN decoder has, from vit_ch at the bottleneck down
@@ -429,8 +470,17 @@ class CNNDecoder(nn.Module):
         # boundary points are generated (entry, then one exit per level) so
         # every level actually shrinks, rather than wasting the first level
         # on a vit_ch -> vit_ch no-op.
-        num_levels = len(reversed_channels)
-        sem_boundaries = _interpolate_schedule(num_levels + 1, vit_ch, semantic_min_ch, shape=semantic_shape)
+        #
+        # When use_semantic_refinement is False (no ViT stage at all, i.e.
+        # vit_layers=0), none of this is built -- no refiners, no vit_ch
+        # -sized parameters anywhere in the decoder. The decoder falls back
+        # to a plain skip-connection U-Net, since there's no semantic map
+        # worth refining in the first place.
+        if use_semantic_refinement:
+            num_levels = len(reversed_channels)
+            sem_boundaries = _interpolate_schedule(
+                num_levels + 1, vit_ch, semantic_min_ch, shape=semantic_shape
+            )
 
         # entry_resolution is cnn_resolution -- where both the CNN feature
         # path (post-bottleneck) and the semantic map (after being resized
@@ -442,11 +492,12 @@ class CNNDecoder(nn.Module):
             self.ups.append(nn.ConvTranspose2d(in_ch, ch, kernel_size=2, stride=2))
             self.blocks.append(ConvBlock(ch * 2, ch, emb_dim))
 
-            in_sem_ch = sem_boundaries[i]
-            out_sem_ch = sem_boundaries[i + 1]
-            next_res = res * 2
-            self.refiners.append(SemanticRefiner(in_sem_ch, out_sem_ch, ch, res, next_res))
-            res = next_res
+            if use_semantic_refinement:
+                in_sem_ch = sem_boundaries[i]
+                out_sem_ch = sem_boundaries[i + 1]
+                next_res = res * 2
+                self.refiners.append(SemanticRefiner(in_sem_ch, out_sem_ch, ch, res, next_res))
+            res = res * 2
 
         # With no CNN layers (pure ViT), the decoder loop above never runs,
         # so the final features are whatever from_vit produced, at
@@ -456,13 +507,19 @@ class CNNDecoder(nn.Module):
 
     def forward(self, x, skip_features, semantic_map, t_emb):
         h = x
-        for up, block, refiner, skip in zip(
-            self.ups, self.blocks, self.refiners, reversed(skip_features)
-        ):
-            h = up(h)
-            h = torch.cat([h, skip], dim=1)
-            h = block(h, t_emb)
-            h, semantic_map = refiner(h, semantic_map)
+        if self.refiners is not None:
+            for up, block, refiner, skip in zip(
+                self.ups, self.blocks, self.refiners, reversed(skip_features)
+            ):
+                h = up(h)
+                h = torch.cat([h, skip], dim=1)
+                h = block(h, t_emb)
+                h, semantic_map = refiner(h, semantic_map)
+        else:
+            for up, block, skip in zip(self.ups, self.blocks, reversed(skip_features)):
+                h = up(h)
+                h = torch.cat([h, skip], dim=1)
+                h = block(h, t_emb)
         return self.output_proj(h)
 
 
@@ -515,6 +572,16 @@ class CorticalRefinerUNet(nn.Module):
         same curve.
     emb_dim : int
         Dimension of the timestep embedding.
+    t_scale : float
+        Rescales t before the sinusoidal frequency bank is applied. The
+        default of 1.0 is correct for DDPM-style integer timesteps in
+        roughly [0, 1000). For EDM-style continuous noise conditioning
+        (passing c_noise = sigma.log() / 4 as t), c_noise's narrow native
+        range (std ~0.3 under common EDM hyperparameters) leaves the
+        embedding unable to distinguish noise levels well -- use
+        SinusoidalTimeEmbedding.scale_for_std(c_noise.std()) to compute an
+        appropriate value, or pass ~1000 as a reasonable starting point
+        under typical EDM defaults (P_mean=-1.2, P_std=1.2).
     num_heads : int
         Attention heads in each ViT block.
     """
@@ -531,6 +598,7 @@ class CorticalRefinerUNet(nn.Module):
         semantic_min_ch=32,
         semantic_shape="linear",
         emb_dim=128,
+        t_scale=1.0,
         in_channels=3,
         out_channels=3,
         num_heads=8,
@@ -539,18 +607,13 @@ class CorticalRefinerUNet(nn.Module):
         super().__init__()
 
         cnn_resolution = img_size // (2 ** cnn_layers)
-        if cnn_resolution % vit_resolution != 0 and vit_resolution % cnn_resolution != 0:
+        if vit_layers > 0 and cnn_resolution % vit_resolution != 0 and vit_resolution % cnn_resolution != 0:
             raise ValueError(
                 f"cnn_resolution ({cnn_resolution}) and vit_resolution ({vit_resolution}) "
                 "must evenly divide one another"
             )
-        if vit_ch <= 0:
-            raise ValueError(
-                f"vit_ch must be a positive integer, got {vit_ch}. The patchify bridge "
-                "(to_vit/from_vit) always runs, even when vit_layers=0, so there's no "
-                "vit_ch value that disables it -- to get a lean pure-CNN model, use a "
-                "small vit_ch (e.g. 8-16) rather than 0."
-            )
+        if vit_ch <= 0 and vit_layers > 0:
+            raise ValueError(f"vit_ch must be a positive integer when vit_layers > 0, got {vit_ch}")
 
         self.img_size = img_size
         self.cnn_layers = cnn_layers
@@ -559,7 +622,7 @@ class CorticalRefinerUNet(nn.Module):
         self.vit_ch = vit_ch
 
         self.time_embed = nn.Sequential(
-            SinusoidalTimeEmbedding(emb_dim),
+            SinusoidalTimeEmbedding(emb_dim, t_scale=t_scale),
             nn.Linear(emb_dim, emb_dim),
             nn.SiLU(),
         )
@@ -569,21 +632,34 @@ class CorticalRefinerUNet(nn.Module):
         self.encoder = CNNEncoder(in_channels, channels, emb_dim)
         encoder_out_ch = self.encoder.out_channels
 
-        self.to_vit = make_resize_layer(encoder_out_ch, vit_ch, cnn_resolution, vit_resolution)
-        self.from_vit = make_resize_layer(vit_ch, encoder_out_ch, vit_resolution, cnn_resolution)
+        # With vit_layers=0 there's no semantic reasoning happening and
+        # nothing for a bridge to feed -- skip building it entirely, so a
+        # pure-CNN config carries zero vit_ch-sized parameters anywhere
+        # (no to_vit/from_vit, no semantic_to_cnn_res, no refiner chain).
+        # The decoder falls back to a plain skip-connection U-Net.
+        self.use_vit = vit_layers > 0
 
-        # Separate, channel-preserving resize for the semantic map itself
-        # (vit_ch -> vit_ch), so it enters the decoder at cnn_resolution --
-        # the same resolution the CNN decoder path starts from -- rather
-        # than at vit_resolution, which differs whenever vit_resolution is
-        # set independently of cnn_resolution. A no-op (1x1 conv) when the
-        # two resolutions already match. Only needed when there's a CNN
-        # decoder to feed at all -- with cnn_layers=0 the decoder's
-        # refiner chain is empty and never touches the semantic map.
-        self.semantic_to_cnn_res = (
-            make_resize_layer(vit_ch, vit_ch, vit_resolution, cnn_resolution)
-            if cnn_layers > 0 else None
-        )
+        if self.use_vit:
+            self.to_vit = make_resize_layer(encoder_out_ch, vit_ch, cnn_resolution, vit_resolution)
+            self.from_vit = make_resize_layer(vit_ch, encoder_out_ch, vit_resolution, cnn_resolution)
+
+            # Separate, channel-preserving resize for the semantic map
+            # itself (vit_ch -> vit_ch), so it enters the decoder at
+            # cnn_resolution -- the same resolution the CNN decoder path
+            # starts from -- rather than at vit_resolution, which differs
+            # whenever vit_resolution is set independently of
+            # cnn_resolution. A no-op (1x1 conv) when the two resolutions
+            # already match. Only needed when there's a CNN decoder to
+            # feed at all -- with cnn_layers=0 the decoder's refiner chain
+            # is empty and never touches the semantic map.
+            self.semantic_to_cnn_res = (
+                make_resize_layer(vit_ch, vit_ch, vit_resolution, cnn_resolution)
+                if cnn_layers > 0 else None
+            )
+        else:
+            self.to_vit = None
+            self.from_vit = None
+            self.semantic_to_cnn_res = None
 
         self.vit_blocks = nn.ModuleList([
             ViTBlock(vit_ch, emb_dim, num_heads=num_heads) for _ in range(vit_layers)
@@ -592,6 +668,7 @@ class CorticalRefinerUNet(nn.Module):
         self.decoder = CNNDecoder(
             channels, out_channels, emb_dim, vit_ch, cnn_resolution, in_channels,
             semantic_min_ch=semantic_min_ch, semantic_shape=semantic_shape,
+            use_semantic_refinement=self.use_vit,
         )
 
     def forward(self, x, t, return_attn=False):
@@ -600,6 +677,15 @@ class CorticalRefinerUNet(nn.Module):
         t_emb = self.time_embed(t)
 
         h, skip_features = self.encoder(x, t_emb)
+
+        if not self.use_vit:
+            # No ViT stage at all: skip the bridge entirely and decode
+            # directly from the CNN encoder's output, plain-U-Net style.
+            out = self.decoder(h, skip_features, None, t_emb)
+            if return_attn:
+                return out, []
+            return out
+
         h = self.to_vit(h)
 
         pos_grid = make_2d_sincos_grid(
