@@ -359,6 +359,141 @@ def make_resize_layer(in_ch, out_ch, in_res, out_res):
 
 
 # =============================================================================
+# Neural field decoder: a smoother alternative to a single large-kernel
+# transposed conv for going straight from the ViT's token grid to pixels.
+# =============================================================================
+def _make_patch_coord_lookup(out_res, grid_res):
+    """
+    For an out_res x out_res pixel grid tokenized by a grid_res x grid_res
+    token grid, returns:
+      token_row_idx, token_col_idx : [out_res, out_res] long tensors --
+        which token each output pixel belongs to.
+      local_x, local_y : [out_res, out_res] float tensors in [-1, 1] --
+        each pixel's position within its own token's patch, with the
+        patch center at 0. Resolution-independent: re-running this with a
+        different out_res still produces values in the same [-1, 1] range,
+        so a decoder trained at one resolution can be queried at another.
+    """
+    if out_res % grid_res != 0:
+        raise ValueError(f"out_res ({out_res}) must be divisible by grid_res ({grid_res})")
+    patch_size = out_res // grid_res
+
+    pixel_idx = torch.arange(out_res)
+    token_idx = pixel_idx // patch_size
+    local_pix = pixel_idx % patch_size
+    denom = (patch_size - 1) / 2
+    local_coord = (local_pix.float() - denom) / (denom if denom > 0 else 1.0)
+
+    token_row_idx = token_idx[:, None].expand(out_res, out_res)
+    token_col_idx = token_idx[None, :].expand(out_res, out_res)
+    local_x = local_coord[None, :].expand(out_res, out_res)  # varies along columns
+    local_y = local_coord[:, None].expand(out_res, out_res)  # varies along rows
+    return token_row_idx, token_col_idx, local_x, local_y
+
+
+def _sincos_encode_coord(coord, num_freqs):
+    """coord: any shape, values in [-1, 1]. Returns [..., num_freqs*2]."""
+    freqs = 2.0 ** torch.arange(num_freqs, device=coord.device, dtype=coord.dtype)
+    args = coord.unsqueeze(-1) * freqs * math.pi
+    return torch.cat([args.sin(), args.cos()], dim=-1)
+
+
+class NeuralFieldDecoder(nn.Module):
+    """
+    Replaces a single large-kernel ConvTranspose2d ("paste each token down
+    as an independent block of pixels, one free weight per output
+    position") with a small MLP shared across every pixel: given a token's
+    feature vector plus the queried pixel's position *within* that token's
+    patch, predict that one pixel's output directly.
+
+    Why this avoids the per-pixel noise a large-kernel transposed conv
+    produces: in the conv, each output position within a patch has its own
+    independent weight, so nothing requires two adjacent output pixels to
+    agree -- a flat region (e.g. a plain white background) requires every
+    one of the kernel's weights to land on almost exactly the same value,
+    which gradient descent has no particular pressure to discover. Here,
+    position is an explicit input to a shared function instead of being
+    baked into per-position weights, and a small MLP with smooth
+    activations naturally tends to produce smoothly-varying output for
+    nearby inputs -- so nearby pixels (which only differ by a small change
+    in local x/y) come out close to each other without that having to be
+    separately learned at every position.
+
+    The local x/y coordinates are sinusoidally encoded (the same idea as
+    SinusoidalTimeEmbedding, applied to position instead of time) before
+    being fed into the MLP, rather than passed in raw. A small MLP biased
+    toward smooth, low-frequency functions of its input (which is exactly
+    the property fixing the noise problem) can otherwise struggle to
+    represent genuine fine-grained texture *within* a patch -- giving the
+    coordinate channel itself some higher-frequency content to work with
+    lets the MLP express that texture without losing the smoothness
+    benefit, since the token's feature vector (not just position) still
+    carries most of the information about what's actually at that patch.
+
+    Implemented as a stack of 1x1 convolutions: a 1x1 conv applies the same
+    linear layer to every spatial position independently, which is exactly
+    what "the same shared MLP evaluated separately at every pixel" means --
+    not an approximation of a per-pixel MLP loop, but an exact, efficient
+    implementation of it.
+    """
+
+    def __init__(self, token_ch, out_channels, num_freqs=6, hidden_ch=128, num_hidden_layers=2):
+        super().__init__()
+        self.num_freqs = num_freqs
+        coord_ch = num_freqs * 2 * 2  # x and y, each sincos-encoded
+        in_ch = token_ch + coord_ch
+
+        layers = [nn.Conv2d(in_ch, hidden_ch, kernel_size=1), nn.GELU()]
+        for _ in range(num_hidden_layers - 1):
+            layers += [nn.Conv2d(hidden_ch, hidden_ch, kernel_size=1), nn.GELU()]
+        layers += [nn.Conv2d(hidden_ch, out_channels, kernel_size=1)]
+        self.mlp = nn.Sequential(*layers)
+
+        self._coord_cache = {}  # (out_res, grid_res, device, dtype) -> precomputed lookup tensors
+
+    def _get_coords(self, out_res, grid_res, device, dtype):
+        # device and dtype are part of the key, not just used to build the
+        # tensors -- otherwise moving the model with .to(device) after a
+        # forward pass has already populated the cache would silently leave
+        # stale-device tensors behind, causing a device-mismatch error (or
+        # worse, silent misbehavior) on the next forward call.
+        key = (out_res, grid_res, device, dtype)
+        if key not in self._coord_cache:
+            token_row_idx, token_col_idx, local_x, local_y = _make_patch_coord_lookup(out_res, grid_res)
+            self._coord_cache[key] = (
+                token_row_idx.to(device),
+                token_col_idx.to(device),
+                local_x.to(device=device, dtype=dtype),
+                local_y.to(device=device, dtype=dtype),
+            )
+        return self._coord_cache[key]
+
+    def forward(self, tokens, out_res):
+        """
+        tokens: [B, token_ch, grid_res, grid_res] -- the ViT's output grid.
+        out_res: target output resolution (must be a multiple of grid_res).
+        Returns: [B, out_channels, out_res, out_res].
+        """
+        B = tokens.shape[0]
+        grid_res = tokens.shape[-1]
+        token_row_idx, token_col_idx, local_x, local_y = self._get_coords(
+            out_res, grid_res, tokens.device, tokens.dtype
+        )
+
+        # gather each output pixel's owning token vector: [B, token_ch, out_res, out_res]
+        gathered = tokens[:, :, token_row_idx, token_col_idx]
+
+        x_enc = _sincos_encode_coord(local_x, self.num_freqs)  # [out_res, out_res, num_freqs*2]
+        y_enc = _sincos_encode_coord(local_y, self.num_freqs)
+        coord_enc = torch.cat([x_enc, y_enc], dim=-1)  # [out_res, out_res, coord_ch]
+        #coord_enc = coord_enc.permute(2, 0, 1).unsqueeze(0).expand(B, -1, out_res, out_res)
+        coord_enc = rearrange("h w c -> b c h w", coord_enc, b=B)
+
+        mlp_input = torch.cat([gathered, coord_enc], dim=1)
+        return self.mlp(mlp_input)
+
+
+# =============================================================================
 # CNN encoder: progressive downsampling, V1/V2-like local processing
 # =============================================================================
 class CNNEncoder(nn.Module):
@@ -639,33 +774,52 @@ class CorticalRefinerUNet(nn.Module):
         # The decoder falls back to a plain skip-connection U-Net.
         self.use_vit = vit_layers > 0
 
+        # With cnn_layers=0 AND vit_layers>0 (pure ViT), from_vit would have
+        # to jump from vit_resolution straight to img_size in one large,
+        # non-overlapping transposed conv -- the single step responsible
+        # for the per-pixel noise this class's docs discuss. There's also
+        # no CNN decoder afterward (output_proj would be a bare 1x1 conv)
+        # to give the network any other chance to enforce neighbor
+        # agreement. NeuralFieldDecoder replaces that whole jump with a
+        # position-as-input MLP, which is smooth in its output by
+        # construction rather than needing every kernel weight to
+        # separately land on the right value. Only relevant in this exact
+        # configuration -- with any CNN layers present, the existing
+        # decoder's overlapping convs already handle this correctly.
+        self.use_neural_field_decoder = self.use_vit and cnn_layers == 0
+
         if self.use_vit:
             self.to_vit = make_resize_layer(encoder_out_ch, vit_ch, cnn_resolution, vit_resolution)
-            self.from_vit = make_resize_layer(vit_ch, encoder_out_ch, vit_resolution, cnn_resolution)
-
-            # Separate, channel-preserving resize for the semantic map
-            # itself (vit_ch -> vit_ch), so it enters the decoder at
-            # cnn_resolution -- the same resolution the CNN decoder path
-            # starts from -- rather than at vit_resolution, which differs
-            # whenever vit_resolution is set independently of
-            # cnn_resolution. A no-op (1x1 conv) when the two resolutions
-            # already match. Only needed when there's a CNN decoder to
-            # feed at all -- with cnn_layers=0 the decoder's refiner chain
-            # is empty and never touches the semantic map.
-            self.semantic_to_cnn_res = (
-                make_resize_layer(vit_ch, vit_ch, vit_resolution, cnn_resolution)
-                if cnn_layers > 0 else None
-            )
+            if self.use_neural_field_decoder:
+                self.from_vit = None
+                self.semantic_to_cnn_res = None
+                self.neural_field_decoder = NeuralFieldDecoder(vit_ch, out_channels)
+            else:
+                self.from_vit = make_resize_layer(vit_ch, encoder_out_ch, vit_resolution, cnn_resolution)
+                self.neural_field_decoder = None
+                # Separate, channel-preserving resize for the semantic map
+                # itself (vit_ch -> vit_ch), so it enters the decoder at
+                # cnn_resolution -- the same resolution the CNN decoder path
+                # starts from -- rather than at vit_resolution, which differs
+                # whenever vit_resolution is set independently of
+                # cnn_resolution. A no-op (1x1 conv) when the two resolutions
+                # already match.
+                self.semantic_to_cnn_res = make_resize_layer(vit_ch, vit_ch, vit_resolution, cnn_resolution)
         else:
             self.to_vit = None
             self.from_vit = None
             self.semantic_to_cnn_res = None
+            self.neural_field_decoder = None
 
         self.vit_blocks = nn.ModuleList([
             ViTBlock(vit_ch, emb_dim, num_heads=num_heads) for _ in range(vit_layers)
         ])
 
-        self.decoder = CNNDecoder(
+        # No CNN decoder at all when using the neural field path -- it goes
+        # straight from the ViT's token grid to pixels, so the usual
+        # skip-connection CNN decoder (which needs encoder feature maps
+        # that don't exist when cnn_layers=0 anyway) isn't built.
+        self.decoder = None if self.use_neural_field_decoder else CNNDecoder(
             channels, out_channels, emb_dim, vit_ch, cnn_resolution, in_channels,
             semantic_min_ch=semantic_min_ch, semantic_shape=semantic_shape,
             use_semantic_refinement=self.use_vit,
@@ -699,15 +853,20 @@ class CorticalRefinerUNet(nn.Module):
             if return_attn:
                 attn_maps.append(attn_map)
 
+        if self.use_neural_field_decoder:
+            out = self.neural_field_decoder(semantic, out_res=self.img_size)
+            if return_attn:
+                return out, attn_maps
+            return out
+
         h = self.from_vit(semantic)
         # The decoder's progressive refinement chain starts from the same
         # resolution the CNN decoder path starts from (cnn_resolution), not
         # vit_resolution -- those differ whenever vit_resolution is set
         # independently of cnn_resolution. Resize the semantic map (still
         # at vit_ch channels) up to cnn_resolution so both decoder inputs
-        # start from a consistent resolution. Skipped entirely when there's
-        # no CNN decoder (cnn_layers=0) to feed.
-        semantic_for_decoder = self.semantic_to_cnn_res(semantic) if self.semantic_to_cnn_res is not None else semantic
+        # start from a consistent resolution.
+        semantic_for_decoder = self.semantic_to_cnn_res(semantic)
         out = self.decoder(h, skip_features, semantic_for_decoder, t_emb)
 
         if return_attn:
