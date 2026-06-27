@@ -359,138 +359,137 @@ def make_resize_layer(in_ch, out_ch, in_res, out_res):
 
 
 # =============================================================================
-# Neural field decoder: a smoother alternative to a single large-kernel
-# transposed conv for going straight from the ViT's token grid to pixels.
+# Neural field decoder: a per-token-weight alternative to a single
+# large-kernel transposed conv for going straight from the ViT's token
+# grid to pixels (PixNerd-style, Wang et al. 2025).
 # =============================================================================
-def _make_patch_coord_lookup(out_res, grid_res):
+
+class PixNerdStyleDecoder(nn.Module):
     """
-    For an out_res x out_res pixel grid tokenized by a grid_res x grid_res
-    token grid, returns:
-      token_row_idx, token_col_idx : [out_res, out_res] long tensors --
-        which token each output pixel belongs to.
-      local_x, local_y : [out_res, out_res] float tensors in [-1, 1] --
-        each pixel's position within its own token's patch, with the
-        patch center at 0. Resolution-independent: re-running this with a
-        different out_res still produces values in the same [-1, 1] range,
-        so a decoder trained at one resolution can be queried at another.
-    """
-    if out_res % grid_res != 0:
-        raise ValueError(f"out_res ({out_res}) must be divisible by grid_res ({grid_res})")
-    patch_size = out_res // grid_res
+    Replaces a single large-kernel ConvTranspose2d with a per-token neural
+    field, following PixNerd (Wang et al. 2025, arXiv:2507.23268): each
+    token's own feature vector generates the WEIGHTS of a small private
+    2-layer MLP for that token's patch, rather than every patch sharing one
+    global MLP. That MLP is then evaluated once per pixel in the patch,
+    conditioned on the pixel's local coordinate AND the actual noisy pixel
+    value at that position (not position alone).
 
-    pixel_idx = torch.arange(out_res)
-    token_idx = pixel_idx // patch_size
-    local_pix = pixel_idx % patch_size
-    denom = (patch_size - 1) / 2
-    local_coord = (local_pix.float() - denom) / (denom if denom > 0 else 1.0)
+    Two distinct problems this addresses, and why each part of the design
+    is doing the work it does:
 
-    token_row_idx = token_idx[:, None].expand(out_res, out_res)
-    token_col_idx = token_idx[None, :].expand(out_res, out_res)
-    local_x = local_coord[None, :].expand(out_res, out_res)  # varies along columns
-    local_y = local_coord[:, None].expand(out_res, out_res)  # varies along rows
-    return token_row_idx, token_col_idx, local_x, local_y
+    1. Persistent per-pixel noise within a patch. A single shared MLP (the
+       earlier NeuralFieldDecoder in this file) has to find one function
+       that works for every token vector it might ever see -- a flat
+       region needs that one shared function to behave correctly for that
+       specific token among everything else it must also represent. Here,
+       each token generates its OWN small MLP's weights directly, so
+       precisely representing "this patch is flat" is a local, per-token
+       fact the network can dial in directly, not something a single
+       global function has to get right for every possible token
+       simultaneously.
 
+    2. Visible seams at patch boundaries. Position-based smoothing only
+       guarantees continuity *within* a patch -- two physically adjacent
+       pixels straddling a boundary belong to different tokens entirely,
+       with no shared mechanism forcing their outputs to agree, even
+       though a real image is continuous right across that boundary.
+       Conditioning each pixel's prediction on the actual noisy pixel
+       value (which IS continuous across the boundary, since the noise
+       was added to a real image with no patch structure) gives the
+       network a shared, patch-independent signal at every boundary --
+       nearby pixels feed in nearby noisy values regardless of which
+       patch they're nominally assigned to, which a model conditioned
+       only on position-plus-token-vector never has access to.
 
-def _sincos_encode_coord(coord, num_freqs):
-    """coord: any shape, values in [-1, 1]. Returns [..., num_freqs*2]."""
-    freqs = 2.0 ** torch.arange(num_freqs, device=coord.device, dtype=coord.dtype)
-    args = coord.unsqueeze(-1) * freqs * math.pi
-    return torch.cat([args.sin(), args.cos()], dim=-1)
-
-
-class NeuralFieldDecoder(nn.Module):
-    """
-    Replaces a single large-kernel ConvTranspose2d ("paste each token down
-    as an independent block of pixels, one free weight per output
-    position") with a small MLP shared across every pixel: given a token's
-    feature vector plus the queried pixel's position *within* that token's
-    patch, predict that one pixel's output directly.
-
-    Why this avoids the per-pixel noise a large-kernel transposed conv
-    produces: in the conv, each output position within a patch has its own
-    independent weight, so nothing requires two adjacent output pixels to
-    agree -- a flat region (e.g. a plain white background) requires every
-    one of the kernel's weights to land on almost exactly the same value,
-    which gradient descent has no particular pressure to discover. Here,
-    position is an explicit input to a shared function instead of being
-    baked into per-position weights, and a small MLP with smooth
-    activations naturally tends to produce smoothly-varying output for
-    nearby inputs -- so nearby pixels (which only differ by a small change
-    in local x/y) come out close to each other without that having to be
-    separately learned at every position.
-
-    The local x/y coordinates are sinusoidally encoded (the same idea as
-    SinusoidalTimeEmbedding, applied to position instead of time) before
-    being fed into the MLP, rather than passed in raw. A small MLP biased
-    toward smooth, low-frequency functions of its input (which is exactly
-    the property fixing the noise problem) can otherwise struggle to
-    represent genuine fine-grained texture *within* a patch -- giving the
-    coordinate channel itself some higher-frequency content to work with
-    lets the MLP express that texture without losing the smoothness
-    benefit, since the token's feature vector (not just position) still
-    carries most of the information about what's actually at that patch.
-
-    Implemented as a stack of 1x1 convolutions: a 1x1 conv applies the same
-    linear layer to every spatial position independently, which is exactly
-    what "the same shared MLP evaluated separately at every pixel" means --
-    not an approximation of a per-pixel MLP loop, but an exact, efficient
-    implementation of it.
+    Row-wise normalization of the generated weights (dividing each output
+    unit's weight vector by its own norm) is a stabilization trick from
+    the same paper: weight-generator output magnitude can vary a lot
+    during training, and normalizing keeps the per-token MLP's effective
+    behavior numerically consistent regardless of how large the raw
+    generated weights happen to be at any point in training.
     """
 
-    def __init__(self, token_ch, out_channels, num_freqs=6, hidden_ch=128, num_hidden_layers=2):
+    def __init__(self, token_ch, out_channels, num_freqs=6, hidden_dim=64):
         super().__init__()
         self.num_freqs = num_freqs
+        self.hidden_dim = hidden_dim
+        self.out_channels = out_channels
+
         coord_ch = num_freqs * 2 * 2  # x and y, each sincos-encoded
-        in_ch = token_ch + coord_ch
+        self.input_dim = coord_ch + out_channels  # + the noisy pixel value itself
 
-        layers = [nn.Conv2d(in_ch, hidden_ch, kernel_size=1), nn.GELU()]
-        for _ in range(num_hidden_layers - 1):
-            layers += [nn.Conv2d(hidden_ch, hidden_ch, kernel_size=1), nn.GELU()]
-        layers += [nn.Conv2d(hidden_ch, out_channels, kernel_size=1)]
-        self.mlp = nn.Sequential(*layers)
+        w1_size = self.input_dim * hidden_dim
+        b1_size = hidden_dim
+        w2_size = hidden_dim * out_channels
+        b2_size = out_channels
+        self._sizes = (w1_size, b1_size, w2_size, b2_size)
+        self.weight_gen = nn.Linear(token_ch, sum(self._sizes))
 
-        self._coord_cache = {}  # (out_res, grid_res, device, dtype) -> precomputed lookup tensors
+        self._coord_cache = {}  # (out_res, grid_res, device, dtype) -> (local_x, local_y)
 
-    def _get_coords(self, out_res, grid_res, device, dtype):
-        # device and dtype are part of the key, not just used to build the
-        # tensors -- otherwise moving the model with .to(device) after a
-        # forward pass has already populated the cache would silently leave
-        # stale-device tensors behind, causing a device-mismatch error (or
-        # worse, silent misbehavior) on the next forward call.
+    def _get_local_coords(self, out_res, grid_res, device, dtype):
+        # Cache key includes device/dtype -- see the equivalent note on the
+        # earlier coordinate-cache implementation this is modeled on: a
+        # cache keyed only on (out_res, grid_res) would silently hold
+        # stale-device tensors after a .to(device) call made after the
+        # cache was first populated.
         key = (out_res, grid_res, device, dtype)
         if key not in self._coord_cache:
-            token_row_idx, token_col_idx, local_x, local_y = _make_patch_coord_lookup(out_res, grid_res)
-            self._coord_cache[key] = (
-                token_row_idx.to(device),
-                token_col_idx.to(device),
-                local_x.to(device=device, dtype=dtype),
-                local_y.to(device=device, dtype=dtype),
-            )
+            patch_size = out_res // grid_res
+            pixel_idx = torch.arange(out_res, device=device, dtype=dtype)
+            local_pix = pixel_idx % patch_size
+            denom = (patch_size - 1) / 2
+            local_coord = (local_pix - denom) / (denom if denom > 0 else 1.0)
+            local_x = local_coord[None, :].expand(out_res, out_res)
+            local_y = local_coord[:, None].expand(out_res, out_res)
+            self._coord_cache[key] = (local_x, local_y)
         return self._coord_cache[key]
 
-    def forward(self, tokens, out_res):
+    def _sincos(self, coord):
+        freqs = 2.0 ** torch.arange(self.num_freqs, device=coord.device, dtype=coord.dtype)
+        args = coord.unsqueeze(-1) * freqs * math.pi
+        return torch.cat([args.sin(), args.cos()], dim=-1)
+
+    def forward(self, tokens, noisy_pixels):
         """
         tokens: [B, token_ch, grid_res, grid_res] -- the ViT's output grid.
-        out_res: target output resolution (must be a multiple of grid_res).
+        noisy_pixels: [B, out_channels, out_res, out_res] -- the actual
+            noisy input image this decoder is predicting from. out_res
+            must be a multiple of grid_res.
         Returns: [B, out_channels, out_res, out_res].
         """
-        B = tokens.shape[0]
-        grid_res = tokens.shape[-1]
-        token_row_idx, token_col_idx, local_x, local_y = self._get_coords(
-            out_res, grid_res, tokens.device, tokens.dtype
+        B, _, gh, gw = tokens.shape
+        out_res = noisy_pixels.shape[-1]
+        if out_res % gh != 0:
+            raise ValueError(f"out_res ({out_res}) must be divisible by grid_res ({gh})")
+        patch_size = out_res // gh
+
+        w1_size, b1_size, w2_size, b2_size = self._sizes
+        gen = self.weight_gen(F.silu(rearrange("b c h w -> b h w c", tokens)))
+        w1 = gen[..., :w1_size].reshape(B, gh, gw, self.hidden_dim, self.input_dim)
+        b1 = gen[..., w1_size:w1_size + b1_size]
+        w2 = gen[..., w1_size + b1_size:w1_size + b1_size + w2_size].reshape(
+            B, gh, gw, self.out_channels, self.hidden_dim
         )
+        b2 = gen[..., -b2_size:]
 
-        # gather each output pixel's owning token vector: [B, token_ch, out_res, out_res]
-        gathered = tokens[:, :, token_row_idx, token_col_idx]
+        w1 = w1 / (w1.norm(dim=-1, keepdim=True) + 1e-6)
+        w2 = w2 / (w2.norm(dim=-1, keepdim=True) + 1e-6)
 
-        x_enc = _sincos_encode_coord(local_x, self.num_freqs)  # [out_res, out_res, num_freqs*2]
-        y_enc = _sincos_encode_coord(local_y, self.num_freqs)
-        coord_enc = torch.cat([x_enc, y_enc], dim=-1)  # [out_res, out_res, coord_ch]
-        #coord_enc = coord_enc.permute(2, 0, 1).unsqueeze(0).expand(B, -1, out_res, out_res)
-        coord_enc = rearrange("h w c -> b c h w", coord_enc, b=B)
+        # broadcast each token's generated weights to every pixel in its patch
+        w1 = w1.repeat_interleave(patch_size, dim=1).repeat_interleave(patch_size, dim=2)
+        b1 = b1.repeat_interleave(patch_size, dim=1).repeat_interleave(patch_size, dim=2)
+        w2 = w2.repeat_interleave(patch_size, dim=1).repeat_interleave(patch_size, dim=2)
+        b2 = b2.repeat_interleave(patch_size, dim=1).repeat_interleave(patch_size, dim=2)
 
-        mlp_input = torch.cat([gathered, coord_enc], dim=1)
-        return self.mlp(mlp_input)
+        local_x, local_y = self._get_local_coords(out_res, gh, tokens.device, tokens.dtype)
+        coord_enc = torch.cat([self._sincos(local_x), self._sincos(local_y)], dim=-1)
+        coord_enc = rearrange("h w c -> b h w c", coord_enc, b=B)
+        pixel_input = torch.cat([coord_enc, rearrange("b c h w -> b h w c", noisy_pixels)], dim=-1)
+
+        h = F.silu(torch.einsum("bhwko,bhwo->bhwk", w1, pixel_input) + b1)
+        out = torch.einsum("bhwok,bhwk->bhwo", w2, h) + b2
+        return rearrange("b h w c -> b c h w", out)
 
 
 # =============================================================================
@@ -780,20 +779,27 @@ class CorticalRefinerUNet(nn.Module):
         # for the per-pixel noise this class's docs discuss. There's also
         # no CNN decoder afterward (output_proj would be a bare 1x1 conv)
         # to give the network any other chance to enforce neighbor
-        # agreement. NeuralFieldDecoder replaces that whole jump with a
-        # position-as-input MLP, which is smooth in its output by
-        # construction rather than needing every kernel weight to
-        # separately land on the right value. Only relevant in this exact
-        # configuration -- with any CNN layers present, the existing
-        # decoder's overlapping convs already handle this correctly.
+        # agreement. PixNerdStyleDecoder replaces that whole jump with a
+        # per-token neural field conditioned on the actual noisy input
+        # pixels, which is smooth across patch boundaries by construction
+        # rather than needing every kernel weight to separately land on
+        # the right value. Only relevant in this exact configuration --
+        # with any CNN layers present, the existing decoder's overlapping
+        # convs already handle this correctly.
         self.use_neural_field_decoder = self.use_vit and cnn_layers == 0
+        if self.use_neural_field_decoder and in_channels != out_channels:
+            raise ValueError(
+                f"PixNerdStyleDecoder conditions on the noisy input pixels directly, "
+                f"so in_channels ({in_channels}) must equal out_channels ({out_channels}) "
+                f"in this configuration (cnn_layers=0, vit_layers>0)."
+            )
 
         if self.use_vit:
             self.to_vit = make_resize_layer(encoder_out_ch, vit_ch, cnn_resolution, vit_resolution)
             if self.use_neural_field_decoder:
                 self.from_vit = None
                 self.semantic_to_cnn_res = None
-                self.neural_field_decoder = NeuralFieldDecoder(vit_ch, out_channels)
+                self.neural_field_decoder = PixNerdStyleDecoder(vit_ch, out_channels)
             else:
                 self.from_vit = make_resize_layer(vit_ch, encoder_out_ch, vit_resolution, cnn_resolution)
                 self.neural_field_decoder = None
@@ -854,7 +860,7 @@ class CorticalRefinerUNet(nn.Module):
                 attn_maps.append(attn_map)
 
         if self.use_neural_field_decoder:
-            out = self.neural_field_decoder(semantic, out_res=self.img_size)
+            out = self.neural_field_decoder(semantic, noisy_pixels=x)
             if return_attn:
                 return out, attn_maps
             return out
