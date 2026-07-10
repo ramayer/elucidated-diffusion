@@ -4,11 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# See:  
+# https://claude.ai/share/df352ae5-7dfa-4947-a677-c139035da2cb
+# for many of the design decisions in this model.
+
 try:
     from einx import dot, rearrange
 except ImportError as e:
     raise ImportError("Please install einx: pip install einx") from e
-
 
 # =============================================================================
 # Time embedding

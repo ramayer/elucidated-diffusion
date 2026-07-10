@@ -352,7 +352,7 @@ jupyter lab
 - [Google — *Image Super-Resolution via Iterative Refinement (SR3)*](https://arxiv.org/abs/2104.07636)  
 - [Kim, et al — *Systematic Review of Hybrid Vision Transformer Architectures for Radiological Image Analysis*](https://www.medrxiv.org/content/10.1101/2024.06.21.24309265v1.full)
 - And the helpful insights of LLM collaborators — ChatGPT, Grok, DeepSeek, and Claude — which made vibe-coding this system possible
-
+- Major advances in image quality here: https://claude.ai/share/df352ae5-7dfa-4947-a677-c139035da2cb
 ---
 
 
