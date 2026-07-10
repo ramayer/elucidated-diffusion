@@ -5,7 +5,7 @@ description = "Vibe-coded implementation of Nvidia Elucidated Diffusion Paper"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    'torch',
+    "torch",
     'torchvision',
     'tqdm',
     'matplotlib',
@@ -16,6 +16,8 @@ dependencies = [
     'objgraph',
     'einx',
     "mlflow",
+    "ipywidgets>=8.1.8",
+    "ipympl>=0.10.0",
 ]
 keywords = []
 authors = [

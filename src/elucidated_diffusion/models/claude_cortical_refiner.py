@@ -510,15 +510,72 @@ class CNNEncoder(nn.Module):
             self.pools.append(nn.AvgPool2d(2))
             cur_ch = out_ch
 
-    def forward(self, x, t_emb):
+    def forward(self, x, t_emb, level_injections=None):
+        """
+        level_injections: optional {level_index: tensor[B, channels[level_index], H, W]},
+        added to that level's block output BEFORE it's stored as a skip
+        connection and before pooling -- so an injected signal reaches both
+        the rest of the encoder (via pooling onward) and the decoder (via
+        the skip connection) from a single addition. Levels are indexed
+        the same way channels/skip_features are: level 0 is the first,
+        highest-resolution block. None (the default) reproduces the exact
+        original forward pass -- existing callers/checkpoints are
+        unaffected.
+        """
         skip_features = []
         h = x
-        for block, pool in zip(self.blocks, self.pools):
+        for i, (block, pool) in enumerate(zip(self.blocks, self.pools)):
             h = block(h, t_emb)
+            if level_injections is not None and i in level_injections:
+                h = h + level_injections[i]
             skip_features.append(h)
             h = pool(h)
         return h, skip_features
 
+class ThumbnailEncoder(nn.Module):
+    """
+    Lightweight adapter that encodes a low-resolution thumbnail at its OWN
+    native resolution -- no upsampling to the target image size -- and
+    projects it, via a zero-initialized final layer, into an additive
+    signal for one matching-resolution stage of the main encoder.
+
+    Zero-init on the final projection means this adapter contributes
+    nothing at the start of training: the backbone runs exactly as it did
+    before the thumbnail was introduced, and learns to use the injected
+    signal from that stable starting point -- the same principle AdaLN
+    already uses in this file for timestep conditioning.
+
+    null_feat is a learned "no conditioning" signal, substituted for the
+    encoded thumbnail during CFG-style training dropout (see
+    thumbnail_drop_prob on CorticalRefinerUNet) and whenever the caller
+    wants unconditional generation at inference. It lives in the same
+    feature space as self.net's output, so both paths share the identical
+    zero-init proj rather than needing two separate output heads.
+    """
+
+    def __init__(self, in_channels, hidden_ch, out_ch, num_layers=3):
+        super().__init__()
+        layers = []
+        cur_ch = in_channels
+        for _ in range(num_layers):
+            layers.append(nn.Conv2d(cur_ch, hidden_ch, 3, padding=1))
+            layers.append(nn.GroupNorm(_largest_valid_group_count(hidden_ch, 8), hidden_ch))
+            layers.append(nn.GELU())
+            cur_ch = hidden_ch
+        self.net = nn.Sequential(*layers)
+
+        self.proj = nn.Conv2d(hidden_ch, out_ch, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+        self.null_feat = nn.Parameter(torch.zeros(1, hidden_ch, 1, 1))
+
+    def forward(self, thumbnail):
+        return self.proj(self.net(thumbnail))
+
+    def null(self, batch_size, height, width, device, dtype):
+        feat = self.null_feat.expand(batch_size, -1, height, width).to(device=device, dtype=dtype)
+        return self.proj(feat)
 
 # =============================================================================
 # Progressive semantic refinement (corticocortical feedback, IT -> V1/V2)
@@ -740,6 +797,10 @@ class CorticalRefinerUNet(nn.Module):
         out_channels=3,
         num_heads=8,
         max_ch=512,
+        thumbnail_resolution=None,
+        thumbnail_channels=3,
+        thumbnail_hidden_ch=64,
+        thumbnail_drop_prob=0.15,
     ):
         super().__init__()
 
@@ -768,6 +829,44 @@ class CorticalRefinerUNet(nn.Module):
 
         self.encoder = CNNEncoder(in_channels, channels, emb_dim)
         encoder_out_ch = self.encoder.out_channels
+
+        # --- Thumbnail (SR) conditioning: optional, off by default ---
+        # thumbnail_resolution=None (the default) builds nothing extra --
+        # this class behaves exactly as before. Setting it wires up a
+        # ThumbnailEncoder that injects additively into the one encoder
+        # level whose spatial resolution matches thumbnail_resolution,
+        # found automatically from img_size (never hardcoded), rather than
+        # upsampling the thumbnail to img_size and concatenating at input.
+        # That avoids two things: the network needing to learn around the
+        # blur signature of an upsample it never needed to see, and the
+        # noisy-input pathway (x_t at every t) picking up a shortcut for
+        # gross structure that would otherwise need to come from x_t
+        # itself. thumbnail_drop_prob controls how often, during training,
+        # the real thumbnail is replaced by ThumbnailEncoder's learned null
+        # signal instead -- the CFG-style dropout that keeps the backbone
+        # practiced at inferring structure with no thumbnail at all.
+        self.thumbnail_encoder = None
+        self.thumbnail_inject_level = None
+        self.thumbnail_drop_prob = thumbnail_drop_prob
+        if thumbnail_resolution is not None:
+            if cnn_layers == 0:
+                raise ValueError("thumbnail conditioning needs cnn_layers > 0 (no encoder stage to inject into)")
+            if img_size % thumbnail_resolution != 0:
+                raise ValueError(f"img_size ({img_size}) must be divisible by thumbnail_resolution ({thumbnail_resolution})")
+            ratio = img_size // thumbnail_resolution
+            log_ratio = math.log2(ratio)
+            if not log_ratio.is_integer():
+                raise ValueError(f"img_size / thumbnail_resolution ({ratio}) must be a power of 2")
+            inject_level = int(log_ratio)
+            if not (0 <= inject_level < cnn_layers):
+                raise ValueError(
+                    f"thumbnail_resolution ({thumbnail_resolution}) implies encoder level "
+                    f"{inject_level}, out of range for cnn_layers={cnn_layers} (valid: 0..{cnn_layers - 1})"
+                )
+            self.thumbnail_inject_level = inject_level
+            self.thumbnail_encoder = ThumbnailEncoder(
+                thumbnail_channels, thumbnail_hidden_ch, channels[inject_level]
+            )
 
         # With vit_layers=0 there's no semantic reasoning happening and
         # nothing for a bridge to feed -- skip building it entirely, so a
@@ -833,13 +932,24 @@ class CorticalRefinerUNet(nn.Module):
             semantic_min_ch=semantic_min_ch, semantic_shape=semantic_shape,
             use_semantic_refinement=self.use_vit,
         )
-
-    def forward(self, x, t, return_attn=False):
+    def forward(self, x, t, thumbnail=None, return_attn=False):
         if t.dim() > 1:
             t = t.squeeze(-1)
         t_emb = self.time_embed(t)
 
-        h, skip_features = self.encoder(x, t_emb)
+        level_injections = None
+        if self.thumbnail_encoder is not None:
+            B = x.shape[0]
+            res = self.img_size // (2 ** self.thumbnail_inject_level)
+            drop = self.training and torch.rand(()) < self.thumbnail_drop_prob
+            if thumbnail is not None and not drop:
+                inject = self.thumbnail_encoder(thumbnail)
+            else:
+                inject = self.thumbnail_encoder.null(B, res, res, device=x.device, dtype=x.dtype)
+            level_injections = {self.thumbnail_inject_level: inject}
+
+        h, skip_features = self.encoder(x, t_emb, level_injections=level_injections)
+        # ...everything below this line is completely unchanged...
 
         if not self.use_vit:
             # No ViT stage at all: skip the bridge entirely and decode

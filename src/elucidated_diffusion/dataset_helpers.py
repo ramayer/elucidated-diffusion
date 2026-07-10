@@ -146,23 +146,28 @@ class AugmentedHRLRDataset(Dataset):
         orig, _ = self.base[idx]
 
         hr = orig.clone()
+        #print(f"in AugmentedHRLRDataset a {hr.shape}, {orig.shape}")
 
         # Flip
         if self.aug.hflip and torch.rand(1) < 0.5:
             hr = torch.flip(hr, dims=[2])
+        #print(f"in AugmentedHRLRDataset b {hr.shape}, {orig.shape}")
 
         # Crop
-        hr = top_biased_square_crop(hr, self.aug)
+        #hr = top_biased_square_crop(hr, self.aug)
+        #print(f"in AugmentedHRLRDataset c {hr.shape}, {orig.shape}")
 
         # Resize to HR
         hr = self._resize_if_needed(hr, self.HR)
+        #print(f"in AugmentedHRLRDataset d {hr.shape}, {orig.shape}")
 
         # Color jitter (expects [0,1])
         if self.aug.color_jitter:
             hr = skin_preserving_color_jitter(hr, self.color)
 
         # LR derived from HR
-        lr = self._resize_if_needed(hr, self.LR)
+        lr = self._resize_if_needed(hr.clone(), self.LR)
+        #print(f"in AugmentedHRLRDataset {hr.shape}, {lr.shape}, {orig.shape}")
 
         return hr, lr, orig
 

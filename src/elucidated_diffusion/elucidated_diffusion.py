@@ -73,7 +73,7 @@ def unified_edm_sampling(model, num_steps=18, batch_size=8, img_shape=(3, 256, 2
         # Model forward pass - handle both diffusion and SR cases
         if is_super_resolution:
             # Super-resolution: pass noisy HR and LR conditioning separately
-            F_x = model(c_in * x_cur, lr_conditioning, c_noise.expand(batch_size))
+            F_x = model(c_in * x_cur, c_noise.expand(batch_size), thumbnail = lr_conditioning)
         else:
             # Pure diffusion: only noisy image, no conditioning
             F_x = model(c_in * x_cur, c_noise.expand(batch_size))
@@ -94,7 +94,7 @@ def unified_edm_sampling(model, num_steps=18, batch_size=8, img_shape=(3, 256, 2
             
             # Second model call for Heun's method
             if is_super_resolution:
-                F_x_next = model(c_in_next * x_next, lr_conditioning, c_noise_next.expand(batch_size))
+                F_x_next = model(c_in_next * x_next, c_noise_next.expand(batch_size), thumbnail = lr_conditioning)
             else:
                 F_x_next = model(c_in_next * x_next, c_noise_next.expand(batch_size))
             
