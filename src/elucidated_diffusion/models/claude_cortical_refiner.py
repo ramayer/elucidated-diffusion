@@ -533,27 +533,7 @@ class CNNEncoder(nn.Module):
         return h, skip_features
 
 class ThumbnailEncoder(nn.Module):
-    """
-    Lightweight adapter that encodes a low-resolution thumbnail at its OWN
-    native resolution -- no upsampling to the target image size -- and
-    projects it, via a zero-initialized final layer, into an additive
-    signal for one matching-resolution stage of the main encoder.
-
-    Zero-init on the final projection means this adapter contributes
-    nothing at the start of training: the backbone runs exactly as it did
-    before the thumbnail was introduced, and learns to use the injected
-    signal from that stable starting point -- the same principle AdaLN
-    already uses in this file for timestep conditioning.
-
-    null_feat is a learned "no conditioning" signal, substituted for the
-    encoded thumbnail during CFG-style training dropout (see
-    thumbnail_drop_prob on CorticalRefinerUNet) and whenever the caller
-    wants unconditional generation at inference. It lives in the same
-    feature space as self.net's output, so both paths share the identical
-    zero-init proj rather than needing two separate output heads.
-    """
-
-    def __init__(self, in_channels, hidden_ch, out_ch, num_layers=3):
+    def __init__(self, in_channels, hidden_ch, out_ch, emb_dim, num_layers=3):
         super().__init__()
         layers = []
         cur_ch = in_channels
@@ -568,14 +548,33 @@ class ThumbnailEncoder(nn.Module):
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
-        self.null_feat = nn.Parameter(torch.zeros(1, hidden_ch, 1, 1))
+        # Per-timestep gate rather than a single constant: how much the
+        # thumbnail should be trusted plausibly differs by noise level (near-
+        # total-noise steps have almost nothing else to go on; near-clean
+        # steps already have most of the answer from x_t itself), so let
+        # gradient descent find that curve instead of hand-picking one
+        # fixed value. Zero-init exactly like AdaLN's to_scale_shift --
+        # gate=0 for every t at the start of training, same as the plain
+        # constant version, just now a function of t_emb rather than a
+        # single number.
+        self.to_gate = nn.Linear(emb_dim, out_ch)
+        nn.init.zeros_(self.to_gate.weight)
+        nn.init.constant_(self.to_gate.bias, 1.0)   # was: nn.init.zeros_(self.to_gate.bias)
 
-    def forward(self, thumbnail):
-        return self.proj(self.net(thumbnail))
+        # Dedicated null-path output, still bypassing proj AND gate
+        # entirely -- "no thumbnail" shouldn't depend on t at all, and
+        # shouldn't be reachable through a pathway that's optimizing for
+        # the conditional case.
+        #self.null_injection = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
+        self.register_buffer("null_injection", torch.zeros(1, out_ch, 1, 1))
+
+
+    def forward(self, thumbnail, t_emb):
+        gate = rearrange("b c -> b c 1 1", self.to_gate(t_emb))
+        return self.proj(self.net(thumbnail)) * gate
 
     def null(self, batch_size, height, width, device, dtype):
-        feat = self.null_feat.expand(batch_size, -1, height, width).to(device=device, dtype=dtype)
-        return self.proj(feat)
+        return self.null_injection.expand(batch_size, -1, height, width).to(device=device, dtype=dtype)
 
 # =============================================================================
 # Progressive semantic refinement (corticocortical feedback, IT -> V1/V2)
@@ -865,7 +864,8 @@ class CorticalRefinerUNet(nn.Module):
                 )
             self.thumbnail_inject_level = inject_level
             self.thumbnail_encoder = ThumbnailEncoder(
-                thumbnail_channels, thumbnail_hidden_ch, channels[inject_level]
+                thumbnail_channels, thumbnail_hidden_ch, channels[inject_level],
+                emb_dim
             )
 
         # With vit_layers=0 there's no semantic reasoning happening and
@@ -943,7 +943,7 @@ class CorticalRefinerUNet(nn.Module):
             res = self.img_size // (2 ** self.thumbnail_inject_level)
             drop = self.training and torch.rand(()) < self.thumbnail_drop_prob
             if thumbnail is not None and not drop:
-                inject = self.thumbnail_encoder(thumbnail)
+                inject = self.thumbnail_encoder(thumbnail, t_emb)   # was: self.thumbnail_encoder(thumbnail)
             else:
                 inject = self.thumbnail_encoder.null(B, res, res, device=x.device, dtype=x.dtype)
             level_injections = {self.thumbnail_inject_level: inject}
