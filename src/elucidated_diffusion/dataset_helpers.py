@@ -43,6 +43,7 @@ class SimpleAugmentConfig:
     hflip: bool = True
 
     # Crop bias (pixels)
+    crop: bool = False
     max_top_crop: int = 4
     max_bottom_crop: int = 24
 
@@ -154,8 +155,9 @@ class AugmentedHRLRDataset(Dataset):
         #print(f"in AugmentedHRLRDataset b {hr.shape}, {orig.shape}")
 
         # Crop
-        #hr = top_biased_square_crop(hr, self.aug)
-        #print(f"in AugmentedHRLRDataset c {hr.shape}, {orig.shape}")
+        if self.aug.crop:
+            hr = top_biased_square_crop(hr, self.aug)
+            print(f"in AugmentedHRLRDataset c {hr.shape}, {orig.shape}")
 
         # Resize to HR
         hr = self._resize_if_needed(hr, self.HR)
@@ -171,3 +173,65 @@ class AugmentedHRLRDataset(Dataset):
 
         return hr, lr, orig
 
+class TwoImageDebugDataset(Dataset):
+    """
+    Minimal 2-image diagnostic dataset: one all-black background with a
+    grey dot, one all-white background with the same grey dot -- same
+    size, same position, same color -- so background color is the ONLY
+    thing that differs between the two images. Useful for isolating
+    whether grey backgrounds come from genuine training/architecture
+    averaging vs. a deterministic sampler's inability to express a
+    bimodal marginal.
+
+    No augmentation applied -- flip/crop/color-jitter would reintroduce
+    variability you're specifically trying to eliminate here. hr/lr use
+    the same bicubic antialiased downsize path as AugmentedHRLRDataset,
+    so the statistics the model sees match normal training. length lets
+    a DataLoader form full batches by cycling between the two images
+    (alternating on even/odd index).
+    """
+
+    def __init__(self, HR, LR, length=256, dot_radius_frac=0.12,
+                 dot_value=0.0, channels=3):
+        self.HR = HR
+        self.LR = LR
+        self.length = length
+
+        self.hr_images = [
+            self._make_image(HR, bg_value=-1.0, dot_value=dot_value,
+                              dot_radius_frac=dot_radius_frac, channels=channels),
+            self._make_image(HR, bg_value=1.0, dot_value=dot_value,
+                              dot_radius_frac=dot_radius_frac, channels=channels),
+        ]
+        self.lr_images = [self._resize(hr, LR) for hr in self.hr_images]
+
+    @staticmethod
+    def _make_image(size, bg_value, dot_value, dot_radius_frac, channels):
+        img = torch.full((channels, size, size), bg_value, dtype=torch.float32)
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, size), torch.linspace(-1, 1, size), indexing="ij"
+        )
+        dist = (xx ** 2 + yy ** 2).sqrt()
+        mask = dist <= dot_radius_frac
+        img[:, mask] = dot_value
+        return torch.clamp(img, -1.0, 1.0)
+
+    @staticmethod
+    def _resize(img, size):
+        if img.shape[-1] == size:
+            return img
+        out = F.interpolate(
+            img.unsqueeze(0), size=(size, size), mode="bicubic",
+            align_corners=False, antialias=True
+        ).squeeze(0)
+        return torch.clamp(out, -1.0, 1.0)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        which = idx % 2
+        hr = self.hr_images[which]
+        lr = self.lr_images[which]
+        orig = hr.clone()  # unused for training; arbitrary resolution field
+        return hr, lr, orig
