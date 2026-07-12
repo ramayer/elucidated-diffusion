@@ -124,7 +124,7 @@ def edm_generate_from_noise(model, num_steps=18, batch_size=8, img_shape=(3, 64,
         headstart_sigma=None
     )
 
-def edm_super_resolve(model, lr_images, num_steps=18, headstart_sigma=None):
+def edm_super_resolve(model, lr_images, img_shape = (3, 256, 256), num_steps=18, headstart_sigma=None):
     """
     Super-resolve LR images to HR.
     
@@ -134,9 +134,7 @@ def edm_super_resolve(model, lr_images, num_steps=18, headstart_sigma=None):
         num_steps: Sampling steps
         headstart_sigma: Optional noise level for headstart
     """
-    batch_size = lr_images.shape[0]
-    img_shape = (3, 256, 256)  # HR output shape
-    
+    batch_size = lr_images.shape[0]    
     return unified_edm_sampling(
         model=model,
         num_steps=num_steps,
@@ -154,7 +152,7 @@ def edm_ancestral_sampling_for_diffusion(model, num_steps=18, batch_size=8, img_
 def edm_ancestral_sampling_for_sr(model, lr_64, num_steps=18, batch_size=8, img_shape=(3, 256, 256), 
                                  headstart_sigma=None):
     """Backward compatibility wrapper"""
-    return edm_super_resolve(model, lr_64, num_steps, headstart_sigma)
+    return edm_super_resolve(model, lr_64, img_shape, num_steps, headstart_sigma)
 
 
 # Example usage:
