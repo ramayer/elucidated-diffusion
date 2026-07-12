@@ -527,7 +527,8 @@ class CNNEncoder(nn.Module):
         for i, (block, pool) in enumerate(zip(self.blocks, self.pools)):
             h = block(h, t_emb)
             if level_injections is not None and i in level_injections:
-                h = h + level_injections[i]
+                gate, content = level_injections[i]
+                h = (1 - gate) * h + gate * content
             skip_features.append(h)
             h = pool(h)
         return h, skip_features
@@ -545,36 +546,23 @@ class ThumbnailEncoder(nn.Module):
         self.net = nn.Sequential(*layers)
 
         self.proj = nn.Conv2d(hidden_ch, out_ch, 1)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-        # Per-timestep gate rather than a single constant: how much the
-        # thumbnail should be trusted plausibly differs by noise level (near-
-        # total-noise steps have almost nothing else to go on; near-clean
-        # steps already have most of the answer from x_t itself), so let
-        # gradient descent find that curve instead of hand-picking one
-        # fixed value. Zero-init exactly like AdaLN's to_scale_shift --
-        # gate=0 for every t at the start of training, same as the plain
-        # constant version, just now a function of t_emb rather than a
-        # single number.
         self.to_gate = nn.Linear(emb_dim, out_ch)
+        
         nn.init.zeros_(self.to_gate.weight)
-        nn.init.constant_(self.to_gate.bias, 1.0)   # was: nn.init.zeros_(self.to_gate.bias)
+        nn.init.constant_(self.to_gate.bias, -10.0)   # gate ≈ 0 at init -> output ≈ h, unchanged
 
-        # Dedicated null-path output, still bypassing proj AND gate
-        # entirely -- "no thumbnail" shouldn't depend on t at all, and
-        # shouldn't be reachable through a pathway that's optimizing for
-        # the conditional case.
-        #self.null_injection = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
-        self.register_buffer("null_injection", torch.zeros(1, out_ch, 1, 1))
-
+        self.out_ch = out_ch
 
     def forward(self, thumbnail, t_emb):
-        gate = rearrange("b c -> b c 1 1", self.to_gate(t_emb))
-        return self.proj(self.net(thumbnail)) * gate
+        content = self.proj(self.net(thumbnail))
+        gate = torch.sigmoid(self.to_gate(t_emb))
+        gate = rearrange("b c -> b c 1 1", gate).expand_as(content)
+        return gate, content
 
     def null(self, batch_size, height, width, device, dtype):
-        return self.null_injection.expand(batch_size, -1, height, width).to(device=device, dtype=dtype)
+        gate = torch.zeros(batch_size, self.out_ch, height, width, device=device, dtype=dtype)
+        content = torch.zeros_like(gate)
+        return gate, content
 
 # =============================================================================
 # Progressive semantic refinement (corticocortical feedback, IT -> V1/V2)
@@ -798,8 +786,7 @@ class CorticalRefinerUNet(nn.Module):
         max_ch=512,
         thumbnail_resolution=None,
         thumbnail_channels=3,
-        thumbnail_hidden_ch=64,
-        thumbnail_drop_prob=0.15,
+        thumbnail_hidden_ch=192,
     ):
         super().__init__()
 
@@ -832,7 +819,7 @@ class CorticalRefinerUNet(nn.Module):
         # --- Thumbnail (SR) conditioning: optional, off by default ---
         # thumbnail_resolution=None (the default) builds nothing extra --
         # this class behaves exactly as before. Setting it wires up a
-        # ThumbnailEncoder that injects additively into the one encoder
+        # ThumbnailEncoder that injects NOT additively into the one encoder
         # level whose spatial resolution matches thumbnail_resolution,
         # found automatically from img_size (never hardcoded), rather than
         # upsampling the thumbnail to img_size and concatenating at input.
@@ -840,13 +827,9 @@ class CorticalRefinerUNet(nn.Module):
         # blur signature of an upsample it never needed to see, and the
         # noisy-input pathway (x_t at every t) picking up a shortcut for
         # gross structure that would otherwise need to come from x_t
-        # itself. thumbnail_drop_prob controls how often, during training,
-        # the real thumbnail is replaced by ThumbnailEncoder's learned null
-        # signal instead -- the CFG-style dropout that keeps the backbone
-        # practiced at inferring structure with no thumbnail at all.
+        # itself.
         self.thumbnail_encoder = None
         self.thumbnail_inject_level = None
-        self.thumbnail_drop_prob = thumbnail_drop_prob
         if thumbnail_resolution is not None:
             if cnn_layers == 0:
                 raise ValueError("thumbnail conditioning needs cnn_layers > 0 (no encoder stage to inject into)")
@@ -938,15 +921,16 @@ class CorticalRefinerUNet(nn.Module):
         t_emb = self.time_embed(t)
 
         level_injections = None
+        # CorticalRefinerUNet.forward -- no internal dropout; caller (mode="both")
+        # is responsible for exercising the unconditional path regularly.
         if self.thumbnail_encoder is not None:
             B = x.shape[0]
             res = self.img_size // (2 ** self.thumbnail_inject_level)
-            drop = self.training and torch.rand(()) < self.thumbnail_drop_prob
-            if thumbnail is not None and not drop:
-                inject = self.thumbnail_encoder(thumbnail, t_emb)   # was: self.thumbnail_encoder(thumbnail)
+            if thumbnail is not None:
+                gate, content = self.thumbnail_encoder(thumbnail, t_emb)
             else:
-                inject = self.thumbnail_encoder.null(B, res, res, device=x.device, dtype=x.dtype)
-            level_injections = {self.thumbnail_inject_level: inject}
+                gate, content = self.thumbnail_encoder.null(B, res, res, device=x.device, dtype=x.dtype)
+            level_injections = {self.thumbnail_inject_level: (gate, content)}
 
         h, skip_features = self.encoder(x, t_emb, level_injections=level_injections)
         # ...everything below this line is completely unchanged...
