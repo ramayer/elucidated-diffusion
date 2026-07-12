@@ -30,7 +30,7 @@ def pil_to_data_url(pil_img: PILImage.Image) -> str:
 def html_for_images(pil_images: List[PILImage.Image], min_height: int = 64, title: str = "Hi") -> str:
     data_urls = [pil_to_data_url(img) for img in pil_images]
     html = f"""
-    <h2>{title}</h2>
+    <h4>{title}</h4>
     <div style="display: flex; flex-wrap: wrap; gap: 2px;">
     """
     for url in data_urls:
